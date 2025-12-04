@@ -1,0 +1,13 @@
+HyperSeg
+    - scripts : 训练与评估脚本（train.py / test.py / data_filter.py / train_all.sh）
+    - hyperseg : 模型与工具代码（原 segment_anything_copy）
+    - segment_anything : 官方 SAM 代码
+    - hyperfree : HyperFree 基线代码
+    - checkpoints : 训练权重保存目录
+    - outputs/out_images : 训练中间结果（如 RGB、mask、gt）
+    - outputs/hyperspectral_classification : 分类/评估输出
+    - logs : 训练与评估日志
+    - references : 对比方法
+    - visualization : 可视化脚本
+    - web_annotations : 网页标注程序
+    - temp : 临时脚本与实验
