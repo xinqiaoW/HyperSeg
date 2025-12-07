@@ -79,13 +79,14 @@ def register_activation_memory_hooks(model):
     return activation_mem, hooks
 
 
-def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_input, transform_output, net_call, save_checkpoint_path, save_name=None, scheduler=False, scheduler_ratio=0.1, device='cuda', feature_mapping=False, show_rgb=False, start_validation=False):
-    if scheduler: # lr scheduler
-        assert scheduler_ratio > 0 and scheduler_ratio < 1
-    
+def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_input, transform_output, net_call, save_checkpoint_path, save_name=None, device='cuda', feature_mapping=False, show_rgb=False, start_validation=False):
     net.train()
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop_epoch)
-    lr_scheduler.last_epoch = args.start_epoch
+    total_batches = len(dataloader) * epochs # total batches
+    lr_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_batches,  # 每个epoch一个完整周期
+            eta_min=lr * 0.01     # 最小学习率
+        )
 
     # mean loss notes
     mean_l = Meaner()
@@ -145,6 +146,7 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
                 point_coords, point_labels = update_points(point_coords, point_labels, bmasks, gt)
 
             optimizer.step()
+            lr_scheduler.step()
 
             if not first_batch_logged:
                 try:
@@ -168,7 +170,7 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
                         h.remove()
                 first_batch_logged = True
 
-            print(f"Loss Batch{batch_idx} focal loss or binary entropy loss:{mean_masks_l.avg} dice loss:{mean_dice_l.avg} loss:{mean_l.avg}")
+            print(f"Loss Batch{batch_idx} focal loss or binary entropy loss:{mean_masks_l.avg} dice loss:{mean_dice_l.avg} loss:{mean_l.avg} Current lr:{optimizer.param_groups[0]['lr']}")
             
             # save model
             if batch_idx % 50 == 0:
@@ -187,7 +189,6 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
                     else:
                         torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"net_{epoch}_{batch_idx}.pth"))
     # save checkpoint after each epoch
-    lr_scheduler.step()
     if save_name is not None:
         torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"{save_name}_{epoch}.pth"))
     else:
@@ -200,18 +201,18 @@ if __name__ == "__main__":
         , help='path wavelengths of the input image'
     )
     parser.add_argument(
-        '--num_iterations', type=int, default=8,
+        '--num_iterations', type=int, default=2,
         )
     parser.add_argument(
-        '--sam_checkpoint', type=str, default=None,
+        '--sam_checkpoint', type=str, default='./checkpoints/sam_vit_h_4b8939.pth',
         help='path to the SAM checkpoint'
     )
     parser.add_argument(
-        '--hyperfree_checkpoint', type=str, default=None,
+        '--hyperfree_checkpoint', type=str, default='./checkpoints/HyperFree-h.pth',
         help='path to the HyperFree checkpoint'
     )
     parser.add_argument(
-        '--device', type=str, default='cuda:6',
+        '--device', type=str, default='cuda:7',
         help='device to use'
     )
     parser.add_argument(
@@ -219,7 +220,7 @@ if __name__ == "__main__":
         help='path to the hsi images'
     )
     parser.add_argument(
-        '--gt_path', type=str, default="/data2/pl/HSITask/data/HyperFree/label_compressed/labels",
+        '--gt_path', type=str, default="/data2/pl/HSITask/data/HyperFree/labels_hf_nms",
         help='path to the gt mask'
     )
     parser.add_argument(
@@ -230,11 +231,7 @@ if __name__ == "__main__":
         help='batch size'
     )
     parser.add_argument(
-        '--only_new_part', type=bool, default=True,
-        help='only train the new part'
-    )
-    parser.add_argument(
-        '--lr', type=float, default=1e-3,
+        '--lr', type=float, default=1e-4,
         help='learning rate'
     )
     parser.add_argument(
@@ -295,9 +292,6 @@ if __name__ == "__main__":
         help='number of workers for data loading'
     )
     parser.add_argument(
-        '--lr_drop_epoch', type=int, default=5
-    )
-    parser.add_argument(
         '--only_hsi_module', action='store_true',help='whether to only use hsi module'
     )
     parser.add_argument(
@@ -344,16 +338,7 @@ if __name__ == "__main__":
         save_name = args.save_name
 
 
-    if args.only_new_part:
-        for name, param in seg.named_parameters():
-            if 'for_appo_shape' in name or 'cross_attention_fusion' in name or 'channel_proj' in name or 'transformer_encoder_layer' in name or 'pos_embed_mlp' in name or 'hf_mlp' in name or 'hf_token' in name:
-                if name.startswith('image_encoder_rgb.pos_embed_mlp.') or name.startswith("image_encoder.pos_embed_mlp"):
-                    param.requires_grad = False
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-    if args.frozen: # higher priority than only_new_part
+    if args.frozen: # higher priority
         for name, param in seg.named_parameters():
             param.requires_grad = False
 

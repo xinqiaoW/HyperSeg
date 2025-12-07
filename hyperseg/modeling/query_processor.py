@@ -121,7 +121,6 @@ class QueryProcessor(nn.Module):
             queries = self.channel_proj(
                 queries.reshape(-1, Embed_dim), 
                 wavelengths, 
-                test_mode=test_mode
             ).view(B, Q_L, -1)
         
         return queries

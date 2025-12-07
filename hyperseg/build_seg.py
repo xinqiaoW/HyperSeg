@@ -32,6 +32,14 @@ def load_and_resize_params(model, checkpoint_path):
     model.load_state_dict(model_dict, strict=False)
     return model
 
+def _set_requires_grad(module, requires_grad: bool):
+    """Utility to toggle gradient computation for a module."""
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+
 def build_seg_vit_h(sam_checkpoint=None,
                     hyperfree_checkpoint=None,
                     channel_proj_spectral=False, 
@@ -128,9 +136,9 @@ def _build_seg(
             vit_dim=encoder_embed_dim,
         ),
         channel_proj_spectral=None if (not channel_proj_spectral) else ChannelProj(
-            out_channels=256,
-            key_wavelengths=spectral_wavelength,
-            preset_wavelengths=[400.0 + (2100.0 / 112.0) * i for i in range(112)],
+            embed_dim=256,
+            hidden_dim=256,
+            num_layers=4
         ),
         # pixel_mean=[123.675, 116.28, 103.53],
         # pixel_std=[58.395, 57.12, 57.375],
@@ -146,7 +154,7 @@ def _build_seg(
             for k in list(state_dict.keys()):
                 # print(k)
                 if k.startswith("image_encoder."):
-                    new_state_dict["image_encoder_rgb." + k[14:]] = state_dict[k]
+                    new_state_dict["rgb_encoder." + k[14:]] = state_dict[k]
                     del state_dict[k]
                 # else:
                 #     new_state_dict[k] = state_dict[k]
@@ -160,10 +168,21 @@ def _build_seg(
             state_dict = torch.load(f, map_location=device)
         
         for k in list(state_dict.keys()):
-            if k.startswith("image_encoder."):
-                new_state_dict[k] = state_dict[k]
+            if k.startswith("image_encoder"):
+                new_state_dict["spectral_encoder." + k[14:]] = state_dict[k]
             else:
                 new_state_dict[k] = state_dict[k]
     
     info = seg.load_state_dict(new_state_dict, strict=False)
+
+    # Freeze pretrained modules (SAM RGB encoder + HyperFree modules)
+    _set_requires_grad(seg.rgb_encoder, False)
+    _set_requires_grad(seg.spectral_encoder, False)
+    _set_requires_grad(seg.mask_decoder, False)
+    _set_requires_grad(seg.prompt_encoder, False)
+
+    # Ensure learnable modules keep gradients enabled
+    _set_requires_grad(seg.query_processor, True)
+    _set_requires_grad(seg.feature_fusion, True)
+
     return seg

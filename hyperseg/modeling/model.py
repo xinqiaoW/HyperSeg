@@ -103,6 +103,7 @@ class HyperSeg(nn.Module):
         self.transform = ResizeLongestSide(self.img_size)  # Image resizing transform
         self.positional_encoder = PositionalEncoding(d_model=self.embed_dim)  # Positional encoding
 
+
     @property
     def device(self) -> torch.device:
         """Get the device of the model."""
@@ -174,7 +175,14 @@ class HyperSeg(nn.Module):
 
         # Project queries to embedding dimension
         if not self.feature_as_query:
-            queries = self.query_processor.project_queries(queries, wavelengths, test_mode)
+            # Ensure wavelengths are provided as a tensor for ChannelProj
+            if isinstance(wavelengths, torch.Tensor):
+                wavelength_tensor = wavelengths.to(device=queries.device, dtype=queries.dtype)
+            else:
+                wavelength_tensor = torch.as_tensor(
+                    wavelengths, device=queries.device, dtype=queries.dtype
+                )
+            queries = self.query_processor.project_queries(queries, wavelength_tensor, test_mode)
 
         # Process the input images to get RGB embeddings
         with torch.no_grad():
