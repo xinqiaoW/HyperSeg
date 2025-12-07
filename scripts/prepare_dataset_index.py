@@ -358,14 +358,14 @@ def main():
                        help='Path to images directory')
     parser.add_argument('--gt_dir', type=str,
                         # default="/data2/pl/HSITask/data/HyperFree/labels_compressed/labels",
-                        default="/data2/pl/HSITask/data/HyperFree/labels_my_hf",
+                        default="/data2/pl/HSITask/data/HyperFree/labels_hf_nms",
                        help='Path to ground truth directory')
     parser.add_argument('--gsd_dir', type=str, 
                        default='/data2/pl/HSITask/data/HyperFree/gsd',
                        help='Path to GSD files directory')
     parser.add_argument('--output', type=str,
                         # default="../data/hyperfree_index.json",
-                        default='../data/hyperfree_index_labels_my_hf.json',
+                        default='../data/hyperfree_index_labels_hf_nms.json',
                        help='Output index file path (JSON)')
     parser.add_argument('--data_name', type=str, default='HyperFree',
                        choices=['HyperFree'],

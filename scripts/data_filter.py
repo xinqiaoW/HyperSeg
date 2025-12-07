@@ -346,58 +346,57 @@ def interpolate_hyperspectral_image_transform_matrix(wave_lib, target_wavelength
 wavelengths = [400.0 + (2100.0 / 112.0) * i for i in range(1, 113)] # needed to be modified
 device = "cuda" if torch.cuda.is_available() else "cpu"
 parser = argparse.ArgumentParser()
-parser.add_argument('--gt_path', type=str, default='/data2/pl/HSITask/data/HyperFree/my_gt_version_3_hf')
-parser.add_argument('--images_path', type=str, default='/data2/pl/HSITask/data/HyperFree/data_compressed')
+parser.add_argument('--index_file', type=str, default='/data2/pl/ImageTask/wxq/HyperSeg_lp/data/hyperfree_index.json')
 parser.add_argument('--threshold', type=float, default=0.36)
 parser.add_argument('--delete', action='store_true')
 args = parser.parse_args()
 
-gt_files = os.scandir(args.gt_path) 
-for i, gtfile in enumerate(gt_files):
-    # gain basename
-    gt_path = gtfile.path
-    gt_file = os.path.basename(gt_path)
-    if gt_file.endswith('.npy'):
-        name, _ = gt_file.split(".")
-        # basename = remove_trailing_digits(name) + '.tif'
-        name_1, name_2 = name[:-3], name[-2:]
-        basename = remove_trailing_digits(name_1) + name_2 + '.tif'
+# 读取JSON索引文件
+with open(args.index_file, 'r') as f:
+    index_data = json.load(f)
+
+samples = index_data['samples']
+print(f"Total samples in index: {len(samples)}")
+
+# 遍历JSON中的samples，检查GT是否存在
+for i, sample in enumerate(samples):
+    img_path = sample['img_path']
+    gt_path = sample['gt_path']
+    
+    # 检查GT是否存在
+    if os.path.exists(gt_path):
+        gt = torch.tensor(np.load(gt_path))
+        if torch.sum(gt) <= 100:
+            continue
+
+        image = tifffile.imread(img_path).transpose(2, 0, 1)  # return numpy array | convert to [c,h,w]
+        image = torch.tensor(image.astype(np.float32))
+        image = (image - image.min()) / (image.max() - image.min())
+
+        if torch.isnan(image).any():
+            continue
+        elif image.max().item() > 1:
+            continue
+        elif image.min().item() < 0:
+            continue
         
-        if os.path.exists(os.path.join(args.images_path, basename)):
-            gt = torch.tensor(np.load(gt_path))
-            if torch.sum(gt) <= 100:
-                continue
-            # self.samples.append((os.path.join(self.images_dir, basename), gt_path))
-            img_path, gt_path = os.path.join(args.images_path, basename), gt_path
 
-            image = tifffile.imread(img_path).transpose(2, 0, 1)  # return numpy array | convert to [c,h,w]
-            image = torch.tensor(image.astype(np.float32))
-            image = (image - image.min()) / (image.max() - image.min())
+        # compute spectral purity\edge score\variance
+        try:
+            image = image.to(device)
+            gt = gt.to(device)
+            spectral_purity, _ = compute_spectral_purity(image, gt)
+            relaxed_consistency_score, _ = compute_relaxed_edge_consistency(image, gt, percentile_threshold=0.9)
+            var = compute_foreground_spectral_variance(image, gt)
+            weighted_score = spectral_purity * 0.35 + relaxed_consistency_score * 0.2  - var * 0.45 * 10
 
-            if torch.isnan(image).any():
-                continue
-            elif image.max().item() > 1:
-                continue
-            elif image.min().item() < 0:
-                continue
-            
-
-            # compute spectral purity\edge score\variance
-            try:
-                image = image.to(device)
-                gt = gt.to(device)
-                spectral_purity, _ = compute_spectral_purity(image, gt)
-                relaxed_consistency_score, _ = compute_relaxed_edge_consistency(image, gt, percentile_threshold=0.9)
-                var = compute_foreground_spectral_variance(image, gt)
-                weighted_score = spectral_purity * 0.35 + relaxed_consistency_score * 0.2  - var * 0.45 * 10
-
-                print(f"{i} {gt_path} {spectral_purity:.4f} {relaxed_consistency_score:.4f} {var:.4f} {weighted_score:.4f}")
-                if weighted_score < args.threshold:
-                    if args.delete:
-                        os.remove(gt_path)
-                del image, gt
-                torch.cuda.empty_cache()
-            except:
-                print(f"{i} {gt_path} error")
-                del image, gt
-                continue
+            print(f"{i} {gt_path} {spectral_purity:.4f} {relaxed_consistency_score:.4f} {var:.4f} {weighted_score:.4f}")
+            if weighted_score < args.threshold:
+                if args.delete:
+                    os.remove(gt_path)
+            del image, gt
+            torch.cuda.empty_cache()
+        except:
+            print(f"{i} {gt_path} error")
+            del image, gt
+            continue

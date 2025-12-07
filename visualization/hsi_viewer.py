@@ -457,7 +457,7 @@ def main():
     parser = argparse.ArgumentParser(description='Hyperspectral Image Viewer')
     parser.add_argument('--index_file', type=str, 
                        # default='../data/hyperfree_index.json',
-                        default='../data/hyperfree_index_labels_my_hf.json',
+                        default='../data/hyperfree_index_labels_hf_nms.json',
                        help='Path to index JSON file')
     args = parser.parse_args()
     
