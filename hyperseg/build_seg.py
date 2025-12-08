@@ -184,5 +184,6 @@ def _build_seg(
     # Ensure learnable modules keep gradients enabled
     _set_requires_grad(seg.query_processor, True)
     _set_requires_grad(seg.feature_fusion, True)
+    _set_requires_grad(seg.hsi_rgb_fusion, True)
 
     return seg

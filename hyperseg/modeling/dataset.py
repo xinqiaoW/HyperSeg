@@ -175,10 +175,17 @@ class CustomDataset(Dataset):
         # Handle regular npy samples
         if len(sample_info) == 3:
             img_path, gt_path, gsd_path = sample_info
-            
+
             # Load ground truth and validate
             temp = np.load(gt_path)
-            gt = torch.tensor(temp == np.random.choice(np.unique(temp[temp > 0])))
+            unique_values = np.unique(temp[temp > 0])
+
+            # Check if there are any positive values
+            if len(unique_values) == 0:
+                # Return a random valid sample if current one is invalid
+                return self.__getitem__((idx + 1) % len(self))
+
+            gt = torch.tensor(temp == np.random.choice(unique_values))
             if torch.sum(gt) <= 100:
                 # Return a random valid sample if current one is invalid
                 return self.__getitem__((idx + 1) % len(self))

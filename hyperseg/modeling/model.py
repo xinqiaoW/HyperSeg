@@ -12,6 +12,7 @@ from .prompt_encoder import PromptEncoder
 from .positional_encoding import PositionalEncoding
 from .query_processor import QueryProcessor
 from .feature_processor import SpectralFeatureFusion
+from .hsi_rgb_fusion import HSIRGBFusion
 from ..utils.spectral_process_utils import interpolate_hyperspectral_image_transform_matrix
 from ..utils.transforms import ResizeLongestSide
 
@@ -98,6 +99,10 @@ class HyperSeg(nn.Module):
             num_heads=8,
             mlp_dim=2048
         )
+
+        # ============ HSI-RGB Fusion Module ============
+        # Fuses RGB embeddings with spatial HSI embeddings before mask decoder
+        self.hsi_rgb_fusion = HSIRGBFusion(channels=self.embed_dim)
 
         # ============ Image Preprocessing Utilities ============
         self.transform = ResizeLongestSide(self.img_size)  # Image resizing transform
@@ -220,6 +225,10 @@ class HyperSeg(nn.Module):
 
         # Use the last stage features as main spatial embeddings
         spatial_embeddings = multi_stage_features[-1]
+
+        # Fuse RGB embeddings with spatial embeddings
+        image_embeddings_rgb = self.hsi_rgb_fusion(image_embeddings_rgb, spatial_embeddings)
+
         # Extract queries from spatial features if using feature-based queries
         if self.feature_as_query:
             with torch.no_grad():

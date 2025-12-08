@@ -212,7 +212,7 @@ if __name__ == "__main__":
         help='path to the HyperFree checkpoint'
     )
     parser.add_argument(
-        '--device', type=str, default='cuda:3',
+        '--device', type=str, default='cuda:7',
         help='device to use'
     )
     parser.add_argument(
