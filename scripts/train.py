@@ -85,7 +85,7 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
     lr_scheduler = CosineAnnealingLR(
             optimizer,
             T_max=total_batches,  # 每个epoch一个完整周期
-            eta_min=lr * 0.01     # 最小学习率
+            eta_min=1e-6    # 最小学习率
         )
 
     # mean loss notes
@@ -212,7 +212,7 @@ if __name__ == "__main__":
         help='path to the HyperFree checkpoint'
     )
     parser.add_argument(
-        '--device', type=str, default='cuda:7',
+        '--device', type=str, default='cuda:0',
         help='device to use'
     )
     parser.add_argument(
@@ -262,7 +262,7 @@ if __name__ == "__main__":
         '--frozen', action='store_true',help='whether to freeze the whole model'
     )
     parser.add_argument(
-        '--checkpoint_path', type=str, default='./checkpoints/net_1_5000.pth',
+        '--checkpoint_path', type=str, default='./checkpoints/net_2_10000.pth',
         help='path to the checkpoint to load'
     )
     parser.add_argument(

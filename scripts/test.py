@@ -130,9 +130,9 @@ if __name__ == "__main__":
     974.848022, 977.070007, 979.291016, 981.512024, 983.732971, 985.953979,
     988.174988, 990.395996, 992.617004, 994.838013, 997.059021, 999.280029]
         GSD = 0.463 # Ground sampling distance (m/pixel)
-        data_path = "./Data/LongKou/WHU-Hi-LongKou.tif"
-        gt_path = "./Data/LongKou/WHU-Hi-LongKou_gt.tif"
-        sample_path = "./Data/LongKou/Test"
+        data_path = "../Data/LongKou/WHU-Hi-LongKou.tif"
+        gt_path = "../Data/LongKou/WHU-Hi-LongKou_gt.tif"
+        sample_path = "../Data/LongKou/Test"
         sample_list = os.listdir(sample_path)
     
     elif args.dataset == 'HanChuan':
@@ -140,10 +140,13 @@ if __name__ == "__main__":
         GSD = 0.109
         data_path = "/data2/pl/ImageTask/wxq/HyperFree_copy/Data/Tiff_format/WHU-Hi-HanChuan/WHU-Hi-HanChuan.tif"
         gt_path = "/data2/pl/ImageTask/wxq/HyperFree_copy/Data/Tiff_format/WHU-Hi-HanChuan/WHU-Hi-HanChuan_gt.tif"
+    # elif args.dataset == "AVIRIS":
+    #     wavelengths = [400.0 + ((2100.0 * i) / 112)for i in range(112)]
+
         
 
-pred_iou_thresh = 0.0  # Controling the model's predicted mask quality in range [0, 1].
-stability_score_thresh = 0.0  # Controling the stability of the mask in range [0, 1].
+pred_iou_thresh = 0.3  # Controling the model's predicted mask quality in range [0, 1].
+stability_score_thresh = 0.4  # Controling the stability of the mask in range [0, 1].
 feature_index_id = 1  # Deciding which stage of encoder features to use
 
 # ckpt_pth = "./checkpoints/HyperFree-h.pth"
@@ -271,12 +274,11 @@ def similarity(vector1, vector2):
 
 
 best_score = -1e9
-best_mask = Image.open(os.path.join(save_dir, "labelled.png"))
-image_array = np.array(best_mask)
+# best_mask = Image.open(os.path.join(save_dir, "labelled.png"))
+# image_array = np.array(best_mask)
 
-image_tensor = torch.from_numpy(image_array).float().to(args.device)
-
-while True:
+# image_tensor = torch.from_numpy(image_array).float().to(args.device)
+for _ in range(20):
     ultimate_gt = torch.zeros((height, width))
     anns = torch.zeros((height, width))
     predictor = SamPredictor(seg, wavelengths)
