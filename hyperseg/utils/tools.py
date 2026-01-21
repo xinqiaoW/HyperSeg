@@ -57,8 +57,8 @@ def transform_output_seg(batched_output):
     return torch.stack([out["logits"][0, 0, :, :] for out in batched_output], dim=0), torch.stack([out["masks"][0, 0, :, :] for out in batched_output], dim=0)
 
 
-def seg_call(net, batched_input, wavelengths, multimask_output=False, GSD=torch.tensor([1.0])):
-    return net(batched_input, wavelengths=wavelengths, multimask_output=multimask_output, GSD=GSD)
+def seg_call(net, batched_input, wavelengths, multimask_output=False):
+    return net(batched_input, wavelengths=wavelengths, multimask_output=multimask_output)
 
 
 def rsshow(I, scale=0.005):

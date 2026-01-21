@@ -110,7 +110,7 @@ class ImageEncoderRGB(nn.Module):
 
         interm_embeddings=[]
         for blk in self.blocks:
-            x = torch.utils.checkpoint.checkpoint(blk, x)
+            x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             # x = blk(x)
             if blk.window_size == 0:
                 interm_embeddings.append(x)

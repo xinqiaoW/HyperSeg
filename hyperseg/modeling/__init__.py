@@ -6,14 +6,10 @@
 
 from .sam import Sam
 from .image_encoder_rgb import ImageEncoderRGB
+from .image_encoder_spectral import ImageEncoderViT
 from .mask_decoder_hq import MaskDecoderHQ
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .transformer import TwoWayTransformer
 from .tiny_vit_sam import TinyViT
-from .image_encoder_spectral import ImageEncoderViT
 from .model import HyperSeg
-from .channel_proj import ChannelProj
-from .positional_encoding import PositionalEncoding
-from .query_processor import QueryProcessor
-from .feature_processor import SpectralFeatureFusion, FeatureUpsampler

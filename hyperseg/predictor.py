@@ -7,8 +7,6 @@
 import numpy as np
 import torch
 
-from .modeling import Sam
-
 from typing import Optional, Tuple, List
 
 from .utils.transforms import ResizeLongestSide
@@ -17,7 +15,7 @@ from .utils.transforms import ResizeLongestSide
 class SamPredictor:
     def __init__(
         self,
-        sam_model: Sam,
+        sam_model,
         wavelengths: List[float] = None,
     ) -> None:
         """
@@ -25,72 +23,14 @@ class SamPredictor:
         allow repeated, efficient mask prediction given prompts.
 
         Arguments:
-          sam_model (Sam): The model to use for mask prediction.
+          sam_model: The model to use for mask prediction.
+          wavelengths: List of wavelengths for the hyperspectral image.
         """
         super().__init__()
         self.model = sam_model
         self.transform = ResizeLongestSide(sam_model.rgb_encoder.img_size)
+        self.wavelengths = wavelengths
         self.reset_image()
-
-    # def set_image(
-    #     self,
-    #     image: np.ndarray,
-    #     image_format: str = "RGB",
-    # ) -> None:
-    #     """
-    #     Calculates the image embeddings for the provided image, allowing
-    #     masks to be predicted with the 'predict' method.
-
-    #     Arguments:
-    #       image (np.ndarray): The image for calculating masks. Expects an
-    #         image in HWC uint8 format, with pixel values in [0, 255].
-    #       image_format (str): The color format of the image, in ['RGB', 'BGR'].
-    #     """
-    #     assert image_format in [
-    #         "RGB",
-    #         "BGR",
-    #     ], f"image_format must be in ['RGB', 'BGR'], is {image_format}."
-    #     # import pdb;pdb.set_trace()
-    #     if image_format != self.model.image_format:
-    #         image = image[..., ::-1]
-
-    #     # Transform the image to the form expected by the model
-    #     # import pdb;pdb.set_trace()
-    #     input_image = self.transform.apply_image(image)
-    #     input_image_torch = torch.as_tensor(input_image, device=self.device)
-    #     input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
-
-    #     self.set_torch_image(input_image_torch, image.shape[:2])
-
-    # @torch.no_grad()
-    # def set_torch_image(
-    #     self,
-    #     transformed_image: torch.Tensor,
-    #     original_image_size: Tuple[int, ...],
-    # ) -> None:
-    #     """
-    #     Calculates the image embeddings for the provided image, allowing
-    #     masks to be predicted with the 'predict' method. Expects the input
-    #     image to be already transformed to the format expected by the model.
-
-    #     Arguments:
-    #       transformed_image (torch.Tensor): The input image, with shape
-    #         1x3xHxW, which has been transformed with ResizeLongestSide.
-    #       original_image_size (tuple(int, int)): The size of the image
-    #         before transformation, in (H, W) format.
-    #     """
-    #     assert (
-    #         len(transformed_image.shape) == 4
-    #         and transformed_image.shape[1] == 3
-    #         and max(*transformed_image.shape[2:]) == self.model.image_encoder.img_size
-    #     ), f"set_torch_image input must be BCHW with long side {self.model.image_encoder.img_size}."
-    #     self.reset_image()
-
-    #     self.original_size = original_image_size
-    #     self.input_size = tuple(transformed_image.shape[-2:])
-    #     input_image = self.model.preprocess(transformed_image)
-    #     self.features, self.interm_features = self.model.image_encoder(input_image)
-    #     self.is_image_set = True
 
     def predict(
         self,
@@ -100,7 +40,7 @@ class SamPredictor:
         mask_input: Optional[np.ndarray] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
-        hq_token_only: bool =False,
+        hq_token_only: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict masks for the given input prompts, using the currently set image.
@@ -134,37 +74,6 @@ class SamPredictor:
             of masks and H=W=256. These low resolution logits can be passed to
             a subsequent iteration as mask input.
         """
-        # if not self.is_image_set:
-        #     raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
-
-        # Transform input prompts
-        # coords_torch, labels_torch, box_torch, mask_input_torch = None, None, None, None
-        # if point_coords is not None:
-        #     assert (
-        #         point_labels is not None
-        #     ), "point_labels must be supplied if point_coords is supplied."
-        #     point_coords = self.transform.apply_coords(point_coords, self.original_size)
-        #     coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=self.device)
-        #     labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=self.device)
-        #     coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
-        # if box is not None:
-        #     box = self.transform.apply_boxes(box, self.original_size)
-        #     box_torch = torch.as_tensor(box, dtype=torch.float, device=self.device)
-        #     box_torch = box_torch[None, :]
-        # if mask_input is not None:
-        #     mask_input_torch = torch.as_tensor(mask_input, dtype=torch.float, device=self.device)
-        #     mask_input_torch = mask_input_torch[None, :, :, :]
-
-        # masks, iou_predictions, low_res_masks = self.predict_torch(
-        #     coords_torch,
-        #     labels_torch,
-        #     box_torch,
-        #     mask_input_torch,
-        #     multimask_output,
-        #     return_logits=return_logits,
-        #     hq_token_only=hq_token_only,
-        # )
-  
         masks_np = masks[0].detach().cpu().numpy()
         iou_predictions_np = iou_predictions[0].detach().cpu().numpy()
         low_res_masks_np = low_res_masks[0].detach().cpu().numpy()
@@ -173,23 +82,23 @@ class SamPredictor:
     @torch.no_grad()
     def predict_torch(
         self,
-        images: torch.Tensor, # B, C, H, W
-        point_coords: Optional[torch.Tensor], # B, N, 2
-        point_labels: Optional[torch.Tensor], # B, N
+        images: torch.Tensor,  # B, H, W, C (note: H, W, C format)
+        point_coords: Optional[torch.Tensor],  # B, N, 2
+        point_labels: Optional[torch.Tensor],  # B, N
         boxes: Optional[torch.Tensor] = None,
         mask_input: Optional[torch.Tensor] = None,
         multimask_output: bool = True,
         return_logits: bool = True,
-        hq_token_only: bool =False,
+        hq_token_only: bool = False,
         wavelengths: List[float] = None,
-        GSD = torch.tensor([1.0]),
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
         """
         Predict masks for the given input prompts, using the currently set image.
         Input prompts are batched torch tensors and are expected to already be
         transformed to the input frame using ResizeLongestSide.
 
         Arguments:
+          images (torch.Tensor): Input images with shape BxHxWxC.
           point_coords (torch.Tensor or None): A BxNx2 array of point prompts to the
             model. Each point is in (X,Y) in pixels.
           point_labels (torch.Tensor or None): A BxN array of labels for the
@@ -209,6 +118,7 @@ class SamPredictor:
             input prompts, multimask_output=False can give better results.
           return_logits (bool): If true, returns un-thresholded masks logits
             instead of a binary mask.
+          wavelengths (List[float]): List of wavelengths for the hyperspectral image.
 
         Returns:
           (torch.Tensor): The output masks in BxCxHxW format, where C is the
@@ -218,63 +128,38 @@ class SamPredictor:
           (torch.Tensor): An array of shape BxCxHxW, where C is the number
             of masks and H=W=256. These low res logits can be passed to
             a subsequent iteration as mask input.
+          None: Placeholder for compatibility (previously returned all_features).
         """
-        # if not self.is_image_set:
-        #     raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
-
-        # if point_coords is not None:
-        #     points = (point_coords, point_labels)
-        # else:
-        #     points = None
-
-        # # Embed prompts
-        # sparse_embeddings, dense_embeddings = self.model.prompt_encoder(
-        #     points=points,
-        #     boxes=boxes,
-        #     masks=mask_input,
-        # )
-
-        # # Predict masks
-        # low_res_masks, iou_predictions = self.model.mask_decoder(
-        #     image_embeddings=self.features,
-        #     image_pe=self.model.prompt_encoder.get_dense_pe(),
-        #     sparse_prompt_embeddings=sparse_embeddings,
-        #     dense_prompt_embeddings=dense_embeddings,
-        #     multimask_output=multimask_output,
-        #     hq_token_only=hq_token_only,
-        #     interm_embeddings=self.interm_features,
-        # )
-
-        # # Upscale the masks to the original image resolution
-        # masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
-
-        # if not return_logits:
-        #     masks = masks > self.model.mask_threshold
-
         b, h, w, c = images.shape
-        images = images.permute(0, 3, 1, 2) # B, C, H, W
+        images = images.permute(0, 3, 1, 2)  # B, C, H, W
 
         if images.max() > 1:
-          images = (images - images.min())/(images.max() - images.min())
+            images = (images - images.min()) / (images.max() - images.min())
+
+        # Use provided wavelengths or fall back to instance wavelengths
+        wl = wavelengths if wavelengths is not None else self.wavelengths
+
         batched_input = []
         for i in range(point_coords.shape[0]):
-          batched_input.append(
-              {
-                  "image": images[i] if images.shape[0] > 1 else images[0],
-                  "original_size": (h, w),
-                  "point_coords": point_coords[i].unsqueeze(0),
-                  "point_labels": point_labels[i].unsqueeze(0),
-              }
-          )
+            batched_input.append(
+                {
+                    "image": images[i] if images.shape[0] > 1 else images[0],
+                    "original_size": (h, w),
+                    "point_coords": point_coords[i].unsqueeze(0),
+                    "point_labels": point_labels[i].unsqueeze(0),
+                }
+            )
 
-        output, all_features = self.model(batched_input, wavelengths=wavelengths, multimask_output=multimask_output, test_mode=True, GSD=GSD)
+        output = self.model(batched_input, wavelengths=wl, multimask_output=multimask_output)
+
         if return_logits:
-          masks = torch.cat([out["logits"] for out in output], dim=0)
+            masks = torch.cat([out["logits"] for out in output], dim=0)
         else:
-          masks = torch.cat([out["masks"] for out in output], dim=0)
+            masks = torch.cat([out["masks"] for out in output], dim=0)
         iou_predictions = torch.cat([out["iou_pred"] for out in output], dim=0)
         low_res_masks = torch.cat([out["low_res_logits"] for out in output], dim=0)
-        return masks, iou_predictions, low_res_masks, all_features
+
+        return masks, iou_predictions, low_res_masks, None
 
     def get_image_embedding(self) -> torch.Tensor:
         """

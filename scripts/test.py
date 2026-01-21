@@ -24,6 +24,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from hyperseg.utils.tools import rsshow
+
+
 def compute_ap(gt: torch.Tensor, preds: torch.Tensor):
     if(preds.shape[2]!=gt.shape[2] or preds.shape[3]!=gt.shape[3]):
         postprocess_preds = F.interpolate(preds, size=gt.size()[2:], mode='bilinear', align_corners=False)
@@ -42,7 +44,7 @@ def create_point_coords(gt: torch.Tensor, num_points: int = 5):
         idx = idx[rand_perm]
         idx = torch.flip(idx, dims=[1])
         point_coords[i] = idx
-    
+
     return point_coords
 
 
@@ -62,19 +64,15 @@ def mask_iou(pred_label, label):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='LongKou')
-    parser.add_argument('--channel_proj_spectral', action='store_true')
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--model', type=str, default='seg')
     parser.add_argument('--point_num', type=int, default=1)
     parser.add_argument('--sam_checkpoint', type=str, default=None)
-    parser.add_argument('--hyperfree_checkpoint', type=str, default=None)
     parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--ignore_hsi_module', action='store_true')
-    parser.add_argument('--ignore_spectral_query', action='store_true')
     parser.add_argument('--remove', action='store_true')
-    parser.add_argument('--feature_as_query', action='store_true')
     parser.add_argument('--samples', type=int, default=0)
+    parser.add_argument('--fixed_hsi_channels', type=int, default=224)
 
     args = parser.parse_args()
 
@@ -134,22 +132,18 @@ if __name__ == "__main__":
         gt_path = "../Data/LongKou/WHU-Hi-LongKou_gt.tif"
         sample_path = "../Data/LongKou/Test"
         sample_list = os.listdir(sample_path)
-    
+
     elif args.dataset == 'HanChuan':
         wavelengths = [400.0 + ((600.0 * i)/ 274.0) for i in range(1, 275)]
         GSD = 0.109
         data_path = "/data2/pl/ImageTask/wxq/HyperFree_copy/Data/Tiff_format/WHU-Hi-HanChuan/WHU-Hi-HanChuan.tif"
         gt_path = "/data2/pl/ImageTask/wxq/HyperFree_copy/Data/Tiff_format/WHU-Hi-HanChuan/WHU-Hi-HanChuan_gt.tif"
-    # elif args.dataset == "AVIRIS":
-    #     wavelengths = [400.0 + ((2100.0 * i) / 112)for i in range(112)]
 
-        
 
 pred_iou_thresh = 0.3  # Controling the model's predicted mask quality in range [0, 1].
 stability_score_thresh = 0.4  # Controling the stability of the mask in range [0, 1].
 feature_index_id = 1  # Deciding which stage of encoder features to use
 
-# ckpt_pth = "./checkpoints/HyperFree-h.pth"
 ROOT = os.path.dirname(os.path.dirname(__file__))
 save_dir = os.path.join(ROOT, "outputs", "hyperspectral_classification")
 os.makedirs(save_dir, exist_ok=True)
@@ -167,30 +161,13 @@ GSD = torch.tensor([[GSD]])
 img_normalized = (img - img.min()) / (img.max() - img.min())
 img_torch = torch.from_numpy(img_normalized).float()
 img_uint8 = (255 * img_normalized).astype(np.uint8)
-#################################################################
-# gt_torch = torch.from_numpy(gt).long().to(args.device)
-# gt_list = []
-# for i in range(gt_torch.max() + 1):
-#     gt_torch_i = gt_torch.clone()
-#     gt_torch_i[gt_torch != i] = 0
-#     gt_torch_i[gt_torch == i] = 1
-#     gt_list.append(gt_torch_i)
 
-# for i, gt_i in enumerate(gt_list):
-#     print(f"i{i}")
-#     idx_y, idx_x = torch.where(gt_i == 1)
-#     length = len(idx_x)
-#     for k in range(30):
-#         print(f"k{k}")
-#         if length - k > 0:
-#             random_idx = random.randint(0, length - 1)
-#             plt.plot(np.arange(len(wavelengths)), img_normalized[:, idx_y[random_idx], idx_x[random_idx]], 'b-')
-#     plt.savefig(os.path.join(save_dir, "spectral_plot_" + str(i) + ".png"))
-#     plt.close()
-#################################################################
 # model
 if args.model == 'seg':
-    seg = build_seg_vit_h(channel_proj_spectral=args.channel_proj_spectral, ignore_hsi_module=args.ignore_hsi_module, ignore_spectral_query=args.ignore_spectral_query, feature_as_query=args.feature_as_query, hyperfree_checkpoint=args.hyperfree_checkpoint, sam_checkpoint=args.sam_checkpoint).to(args.device)
+    seg = build_seg_vit_h(
+        sam_checkpoint=args.sam_checkpoint,
+        fixed_hsi_channels=args.fixed_hsi_channels
+    ).to(args.device)
     if args.checkpoint is not None:
         info = seg.load_state_dict(torch.load(args.checkpoint, map_location=args.device), strict=False)
     seg.eval()
@@ -203,81 +180,23 @@ if args.model == 'seg':
 elif seg.model == 'hyperfree':
     pass
 
-# few_shots = []  # Storing binary maps for each class, where the non-zero location represents the corresponding sample
-# num_classes = 9
-# for i in range(num_classes):
-#     few_shots.append(np.zeros((height, width)))
 
-# few_shots[0][388, 42] = 1
-# few_shots[1][231, 42] = 1
-# few_shots[2][159, 18] = 1
-# few_shots[3][40, 329] = 1
-# few_shots[4][192, 285] = 1
-# few_shots[5][360, 280] = 1
-# few_shots[6][265, 174] = 1
-# few_shots[7][355, 108] = 1
-# few_shots[8][34, 238] = 1
-# max_oa = -1e9
-# max_aa = -1e9
-# max_ka = -1e9
-# while True:
-#     few_shots = []
-#     for i in range(num_classes):
-#         few_shots.append(np.zeros((height, width)))
-#     for j in range(num_classes):
-#         idx = np.where(gt == j + 1)
-#         k = random.randint(0, len(idx) - 1)
-#         few_shots[j][idx[k]] = 1
-
-#     classification_maps_each_class, classification_map = hyperspectral_classification(
-#         mask_generator=mask_generator,
-#         image=img_uint8.transpose((1, 2, 0)), # (H, W, C)
-#         few_shots=few_shots,
-#         spectral_lengths=wavelengths,
-#         feature_index_id=feature_index_id,
-#         GSD=torch.tensor([1.0]),
-#     )
-
-#     show_anns(classification_maps_each_class, save_dir)
-
-#     segmetric = SegMetric(
-#     gt = torch.tensor(gt),
-#     pred_mask = torch.tensor(classification_map),
-#     num_classes = num_classes
-#     )
-
-#     oa, aa, ka = segmetric.compute_metrics()
-#     print(f"Overall Accuracy: {oa}")
-#     print(f"Average Accuracy: {aa}")
-#     print(f"Kappa Coefficient: {ka}")
-#     if oa > max_oa:
-#         max_oa = oa
-#         print("New Max Overall Accuracy:", oa)
-#     if aa > max_aa:
-#         max_aa = aa
-#         print("New Max Average Accuracy:", aa)
-#     if ka > max_ka:
-#         max_ka = ka
-#         print("New Max Kappa Coefficient:", ka)
 def similarity(vector1, vector2):
     dot_product = np.dot(vector1, vector2)
 
     norm_v1 = np.linalg.norm(vector1)
     norm_v2 = np.linalg.norm(vector2)
-    # 计算余弦相似度
+    # cosine similarity
     consine_similarity = dot_product / (norm_v1 * norm_v2)
 
-    # 计算 1 范数
+    # L1 norm
     l1_norm = 1 / np.sum(np.abs(vector1 - vector2))
     print(f"cosine similarity: {consine_similarity}, l1_norm: {l1_norm}")
     return consine_similarity
 
 
 best_score = -1e9
-# best_mask = Image.open(os.path.join(save_dir, "labelled.png"))
-# image_array = np.array(best_mask)
 
-# image_tensor = torch.from_numpy(image_array).float().to(args.device)
 for _ in range(20):
     ultimate_gt = torch.zeros((height, width))
     anns = torch.zeros((height, width))
@@ -290,82 +209,6 @@ for _ in range(20):
         gt_torch_i[gt_torch == i] = 1
         gt_list.append(gt_torch_i)
 
-    #############################
-    # few_shots = []
-    # few_points = []
-    # few_vectors = []
-    # num_classes = 9
-    # for i in range(num_classes):
-    #     few_shots.append(np.zeros((height, width)))
-    # for j in range(num_classes):
-    #     idx = np.where(gt == j + 1)
-    #     k = random.randint(0, len(idx[0]) - 1)
-    #     # few_shots[j][idx[k]] = 1
-    #     few_points.append(torch.tensor([[idx[1][k], idx[0][k]]]))
-    ####
-    # few_points = []
-    # few_vectors = []
-    # few_points.append(torch.tensor([[363, 111]]))
-    # few_points.append(torch.tensor([[ 15, 249]]))
-    # few_points.append(torch.tensor([[ 38, 154]]))
-    # few_points.append(torch.tensor([[342,  31]]))
-    # few_points.append(torch.tensor([[259, 193]]))
-    # few_points.append(torch.tensor([[274, 394]]))
-    # few_points.append(torch.tensor([[221, 140]]))
-    # few_points.append(torch.tensor([[ 90, 215]]))
-    # few_points.append(torch.tensor([[236, 122]]))
-
-    # ###
-    # for i, point in enumerate(few_points):
-    #     masks, _, _, all_features = predictor.predict_torch(
-    #             images = img_torch.to(args.device).unsqueeze(0).permute(0, 2, 3, 1),
-    #             point_coords = point.to(args.device).unsqueeze(0),
-    #             point_labels = torch.ones((1, point.shape[0])).to(args.device),
-    #             multimask_output=False,
-    #             wavelengths = wavelengths,
-    #             return_logits=False,
-    #             GSD = torch.tensor([1.0])
-    #         )
-    #     few_masks = (masks[0] > 0).int() * img_torch.to(args.device)
-    #     few_vectors.append(few_masks.mean(dim=[1, 2]))
-    #############################
-    # ap_list = []
-    # iou_list = []
-
-    # ultimate_gt = torch.zeros((height, width))
-    # x = torch.arange(0, width, 5).unsqueeze(0).repeat((height // 5, 1))
-    # y = torch.arange(0, height, 5).unsqueeze(1).repeat((1, width // 5))
-
-    # point_coords = torch.stack([x, y], dim=-1).reshape(-1, 2)
-    # best_cls_point_score = [-1e9, -1e9, -1e9, -1e9, -1e9, -1e9, -1e9, -1e9, -1e9]
-    # for point_sq in range(point_coords.shape[0]):
-    #     print(point_sq)
-    #     masks, _, _, all_features = predictor.predict_torch(
-    #                 images = img_torch.to(args.device).unsqueeze(0).permute(0, 2, 3, 1),
-    #                 point_coords = point_coords[point_sq:(point_sq+1), :].to(args.device).unsqueeze(0),
-    #                 point_labels = torch.ones((1, 1)).to(args.device),
-    #                 multimask_output=False,
-    #                 wavelengths = wavelengths,
-    #                 return_logits=False,
-    #                 GSD = torch.tensor([1.0])
-    #             )
-    #     max_score = -1e9
-    #     mask = (masks[0] > 0)
-    #     numer = -1
-    #     for cls_num in range(1, gt_torch.max() + 1):
-    #         score = 0
-    #         mask_gt =  mask.int() * gt_list[cls_num]
-    #         score = mask_gt.sum()
-    #         if score > max_score:
-    #             max_score = score
-    #             numer = cls_num - 1
-    #             best_mask = (masks[0] > 0)
-
-    #     if max_score > best_cls_point_score[numer]:
-    #         best_cls_point_score[numer] = max_score
-    #         ultimate_gt[best_mask[0, :, :]] = numer
-        
-    #     del masks
     ultimate_gt = torch.zeros((height, width))
     for i in range(len(gt_list)):
         print(f"Class {i}")
@@ -381,25 +224,22 @@ for _ in range(20):
                 continue
 
             point_coords = create_point_coords(gt_in.unsqueeze(0), num_points=args.point_num)
-                # point_coords = create_point_coords(gt_in.unsqueeze(0), num_points=20)
-            
+
             best_point_score = -1e9
             for point_sq in range(point_coords.shape[1]):
-                # point_coords = predictor.transform.apply_coords_torch(point_coords.to(args.device), img.shape[:2])
-                masks, _, _, all_features = predictor.predict_torch(
+                masks, _, _, _ = predictor.predict_torch(
                     images = img_torch.to(args.device).unsqueeze(0).permute(0, 2, 3, 1),
                     point_coords = point_coords[:, point_sq:(point_sq+1), :].to(args.device),
                     point_labels = torch.ones((1, 1)).to(args.device),
                     multimask_output=False,
                     wavelengths = wavelengths,
                     return_logits=False,
-                    GSD = torch.tensor(GSD) 
                 )
                 masks = masks[0]
                 mask = (masks > 0)
                 # mask_gt
                 max_score = (mask.int() * gt_list[i]).sum() / (gt_list[i].sum() + mask.int().sum())
-                
+
                 if max_score > best_point_score:
                     best_point_score = max_score
                     print(best_point_score)
@@ -410,7 +250,7 @@ for _ in range(20):
 
     seg_metric = SegMetric(
         gt = gt_torch.detach().cpu(),
-        pred_mask = ultimate_gt, 
+        pred_mask = ultimate_gt,
         num_classes = gt_torch.max()
     )
     oa, aa, ka = seg_metric.compute_metrics()
@@ -427,5 +267,3 @@ for _ in range(20):
     print(f"best: {best_score}")
     if args.remove:
             os.remove(args.checkpoint)
-
-            

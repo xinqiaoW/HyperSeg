@@ -84,8 +84,8 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
     total_batches = len(dataloader) * epochs # total batches
     lr_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=total_batches,  # 每个epoch一个完整周期
-            eta_min=1e-6    # 最小学习率
+            T_max=total_batches,
+            eta_min=1e-6
         )
 
     # mean loss notes
@@ -105,7 +105,7 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
             # generate point coords as prompt
             point_coords = create_point_coords(gt, num_points=1).to(device)
             point_labels = torch.ones((B, point_coords.shape[1])).to(device)
-            
+
             # reset meaner
             mean_l.reset()
             mean_dice_l.reset()
@@ -116,8 +116,8 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
             for iteration in range(args.num_iterations):
                 # build input
                 batched_input = build_input(images, shape=(H, W), point_coords=point_coords, point_labels=point_labels, device=device)
-                # forward
-                batched_output, all_features = net_call(net, batched_input, wavelengths=wavelengths, multimask_output=False, GSD=gsd)
+                # forward (new interface without GSD)
+                batched_output = net_call(net, batched_input, wavelengths=wavelengths, multimask_output=False)
                 # get logits from output
                 logits, bmasks = transform_output(batched_output)
                 # compute loss
@@ -128,13 +128,6 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
                 mean_dice_l.update(loss_dice.item())
                 mean_masks_l.update(loss_mask.item())
 
-                if feature_mapping:
-                    feature_map = all_features[-1] # B, C, H', W'
-                    for k in range(B):
-                        fe = feature_map[k] # C, H', W'
-                        fmap = pca_dr(fe.detach().cpu().numpy())
-                        cv2.imwrite(os.path.join(args.out_images, f"feature_map_{epoch}_{batch_idx}_{k}.png"), (fmap * 255).astype(np.uint8))
-                
                 if show_rgb:
                     rgb = torch.flip(batched_output[0]["rgb"][0].permute(1, 2, 0), dims=[-1]).detach().cpu().numpy()
                     # cv2.imwrite(os.path.join(args.out_images, f"rgb_{epoch}_{batch_idx}_{i}.png"), (rgb * 255).astype(np.uint8))
@@ -171,7 +164,7 @@ def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_
                 first_batch_logged = True
 
             print(f"Loss Batch{batch_idx} focal loss or binary entropy loss:{mean_masks_l.avg} dice loss:{mean_dice_l.avg} loss:{mean_l.avg} Current lr:{optimizer.param_groups[0]['lr']}")
-            
+
             # save model
             if batch_idx % 50 == 0:
                 if batch_idx % 400 == 0:
@@ -206,10 +199,6 @@ if __name__ == "__main__":
     parser.add_argument(
         '--sam_checkpoint', type=str, default='./checkpoints/sam_vit_h_4b8939.pth',
         help='path to the SAM checkpoint'
-    )
-    parser.add_argument(
-        '--hyperfree_checkpoint', type=str, default='./checkpoints/HyperFree-h.pth',
-        help='path to the HyperFree checkpoint'
     )
     parser.add_argument(
         '--device', type=str, default='cuda:0',
@@ -247,8 +236,8 @@ if __name__ == "__main__":
         help='path where images saves'
     )
     parser.add_argument(
-        '--channel_proj_spectral', action='store_true', default=True,
-        help='use spectral channel projection'
+        '--fixed_hsi_channels', type=int, default=224,
+        help='fixed number of HSI channels for interpolation'
     )
     parser.add_argument(
         '--point_num', type=int, default=None,
@@ -266,23 +255,10 @@ if __name__ == "__main__":
         help='path to the checkpoint to load'
     )
     parser.add_argument(
-        '--ignore_hsi_module', action='store_true',help='whether to ignore hsi module, for ablation study'
-    )
-    parser.add_argument(
-        '--ignore_spectral_query', action='store_true',help='whether to ignore spectral query, for ablation study'
-    )
-    parser.add_argument(
-        '--feature_as_query', action='store_true',help='whether to use feature as query'
-    )
-    parser.add_argument(
         '--save_name', type=str, default=None,
     )
     parser.add_argument(
         '--start_epoch', type=int, default=0,
-    )
-    
-    parser.add_argument(
-        '--save_feature_mapping', action='store_true',help='whether to save feature mapping for visualization'
     )
     parser.add_argument(
         '--parallel', action='store_true',help='whether to use DataParallel'
@@ -290,9 +266,6 @@ if __name__ == "__main__":
     parser.add_argument(
         '--num_workers', type=int, default=1,
         help='number of workers for data loading'
-    )
-    parser.add_argument(
-        '--only_hsi_module', action='store_true',help='whether to only use hsi module'
     )
     parser.add_argument(
         '--show_rgb', action='store_true',help='whether to show rgb image'
@@ -304,18 +277,15 @@ if __name__ == "__main__":
     os.makedirs(args.save_checkpoint_path, exist_ok=True)
     os.makedirs(args.out_images, exist_ok=True)
     os.makedirs('./logs', exist_ok=True)
-    seg = build_seg_vit_h(sam_checkpoint=args.sam_checkpoint,
-                          hyperfree_checkpoint=args.hyperfree_checkpoint,
-                          channel_proj_spectral=args.channel_proj_spectral,
-                          ignore_hsi_module=args.ignore_hsi_module, 
-                          ignore_spectral_query=args.ignore_spectral_query,
-                          feature_as_query=args.feature_as_query,
-                          only_hsi_module=args.only_hsi_module)
-    
+
+    # Build model with new simplified interface
+    seg = build_seg_vit_h(
+        sam_checkpoint=args.sam_checkpoint,
+        fixed_hsi_channels=args.fixed_hsi_channels
+    )
+
     if args.parallel:
-        # device_ids = args.device.split(',')
         seg = nn.DataParallel(seg, device_ids=[0, 1])
-        # seg = seg.cuda(device=int(device_ids[0]))
     seg = seg.to(args.device)
 
     # load state dict
@@ -324,19 +294,11 @@ if __name__ == "__main__":
         model_state_dict = torch.load(args.checkpoint_path)
         seg.load_state_dict(model_state_dict, strict=False)
         del model_state_dict
-    
+
     dataset = CustomDataset(args.hsi_path, args.gt_path, index_file=args.index_file)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers)
-    # different config, different 'save name'.This is for ablation study
-    if args.ignore_hsi_module:
-        save_name = 'without_hsi_module'
-    elif args.ignore_spectral_query:
-        save_name = 'without_spectral_query'
-    elif args.only_hsi_module:
-        save_name = 'only_hsi_module'
-    else:
-        save_name = args.save_name
 
+    save_name = args.save_name
 
     if args.frozen: # higher priority
         for name, param in seg.named_parameters():
@@ -344,9 +306,7 @@ if __name__ == "__main__":
 
     torch.cuda.empty_cache()
     optimizer = optim.Adam(seg.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
-    
+
     log_module_param_memory(seg, log_dir='./logs', filename='module_param_memory.txt')
 
-    train(seg, args.lr, args.epochs, dataloader, optimizer, wavelengths=args.wavelengths, point_num=args.point_num, build_input=build_input_for_hyperseg, transform_output=transform_output_seg, net_call=seg_call, save_checkpoint_path=args.save_checkpoint_path, device=args.device, save_name=save_name, feature_mapping=args.save_feature_mapping, show_rgb=args.show_rgb, start_validation=args.start_validation)
-
-
+    train(seg, args.lr, args.epochs, dataloader, optimizer, wavelengths=args.wavelengths, point_num=args.point_num, build_input=build_input_for_hyperseg, transform_output=transform_output_seg, net_call=seg_call, save_checkpoint_path=args.save_checkpoint_path, device=args.device, save_name=save_name, show_rgb=args.show_rgb, start_validation=args.start_validation)
