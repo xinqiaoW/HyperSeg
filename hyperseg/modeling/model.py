@@ -182,7 +182,7 @@ class HSIPatchEmbed(nn.Module):
         x_interp = x_interp.squeeze(1).view(B, self.fixed_channels, H, W)
 
         return x_interp
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -456,7 +456,7 @@ class HyperSeg(nn.Module):
 
         for batch_idx, image_record in enumerate(batched_input):
             if "point_coords" in image_record:
-                coords = image_record["point_coords"]  # (N, 2)
+                coords = image_record["point_coords"][0]  # (N, 2)
                 # Clamp coordinates to valid range
                 x_coords = coords[:, 0].clamp(0, W - 1).long()
                 y_coords = coords[:, 1].clamp(0, H - 1).long()
