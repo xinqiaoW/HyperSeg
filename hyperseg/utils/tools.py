@@ -50,11 +50,20 @@ def build_input_for_hyperseg(images, shape, point_coords, point_labels, device='
     return batched_input
 
 
-def transform_output_seg(batched_output):
+def transform_output_seg(batched_output, multimask_output=True):
     '''
     transform output from hyperseg to proper expression
+
+    When multimask_output=True:
+        Returns logits [B, 3, H, W] and masks [B, 3, H, W]
+    When multimask_output=False:
+        Returns logits [B, H, W] and masks [B, H, W]
     '''
-    return torch.stack([out["logits"][0, 0, :, :] for out in batched_output], dim=0), torch.stack([out["masks"][0, 0, :, :] for out in batched_output], dim=0)
+    if multimask_output:
+        # Return all 3 masks: [B, 3, H, W]
+        return torch.stack([out["logits"][0, :, :, :] for out in batched_output], dim=0), torch.stack([out["masks"][0, :, :, :] for out in batched_output], dim=0)
+    else:
+        return torch.stack([out["logits"][0, 0, :, :] for out in batched_output], dim=0), torch.stack([out["masks"][0, 0, :, :] for out in batched_output], dim=0)
 
 
 def seg_call(net, batched_input, wavelengths, multimask_output=False, start_band=None, num_bands=None):

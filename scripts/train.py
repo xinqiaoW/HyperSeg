@@ -59,6 +59,56 @@ def log_module_param_memory(
         f.write('\n'.join(lines))
 
 
+def compute_best_mask_loss(
+    logits: torch.Tensor,
+    bmasks: torch.Tensor,
+    gt: torch.Tensor,
+) -> tuple[torch.Tensor, float, float, list[int], torch.Tensor]:
+    """
+    Compute loss on all masks and select the best mask per sample.
+
+    Args:
+        logits: Predicted logits [B, 3, H, W]
+        bmasks: Predicted masks [B, 3, H, W]
+        gt: Ground truth masks [B, H, W]
+
+    Returns:
+        total_loss: Sum of best losses for all samples (for backprop)
+        avg_mask_loss: Average mask loss across batch
+        avg_dice_loss: Average dice loss across batch
+        best_mask_indices: List of best mask index for each sample
+        best_bmasks: Best masks selected for each sample [B, H, W]
+    """
+    B = gt.shape[0]
+    gt_expanded = gt.float().unsqueeze(1)  # [B, 1, H, W]
+
+    total_loss = 0
+    total_mask_loss = 0
+    total_dice_loss = 0
+    best_mask_indices = []
+
+    for b in range(B):
+        sample_losses = []
+        for mask_idx in range(3):
+            mask_logits = logits[b:b+1, mask_idx:mask_idx+1, :, :]  # [1, 1, H, W]
+            sample_gt = gt_expanded[b:b+1]  # [1, 1, H, W]
+            loss_mask_i, loss_dice_i = loss_masks(mask_logits, sample_gt, num_masks=1)
+            loss_i = loss_mask_i + loss_dice_i
+            sample_losses.append((loss_i, loss_mask_i, loss_dice_i, mask_idx))
+
+        # Find the mask with smallest loss for this sample
+        min_loss, min_mask_loss, min_dice_loss, best_idx = min(sample_losses, key=lambda x: x[0].item())
+        total_loss = total_loss + min_loss
+        total_mask_loss += min_mask_loss.item()
+        total_dice_loss += min_dice_loss.item()
+        best_mask_indices.append(best_idx)
+
+    # Select best masks for each sample
+    best_bmasks = torch.stack([bmasks[b, best_mask_indices[b], :, :] for b in range(B)], dim=0)
+
+    return total_loss, total_mask_loss / B, total_dice_loss / B, best_mask_indices, best_bmasks
+
+
 def register_activation_memory_hooks(model: nn.Module) -> tuple[dict, list]:
     """Register forward hooks to track activation memory usage."""
     module_to_name = {module: (name if name else '<root>') for name, module in model.named_modules()}
@@ -222,26 +272,29 @@ def train(
                     device=device
                 )
                 batched_output = net_call(
-                    net, batched_input, wavelengths=wavelengths, multimask_output=False,
+                    net, batched_input, wavelengths=wavelengths, multimask_output=True,
                     start_band=start_band, num_bands=num_bands
                 )
-                logits, bmasks = transform_output(batched_output)
+                # logits: [B, 3, H, W], bmasks: [B, 3, H, W]
+                logits, bmasks = transform_output(batched_output, multimask_output=True)
 
-                loss_mask, loss_dice = loss_masks(logits.unsqueeze(1), gt.float().unsqueeze(1), num_masks=B)
-                loss = (loss_mask + loss_dice) / num_iterations
+                # Compute best mask loss per sample and aggregate
+                total_loss, avg_mask_loss, avg_dice_loss, best_mask_indices, best_bmasks = \
+                    compute_best_mask_loss(logits, bmasks, gt)
+                loss = total_loss / (B * num_iterations)
 
                 mean_loss.update(loss.item())
-                mean_dice_loss.update(loss_dice.item())
-                mean_mask_loss.update(loss_mask.item())
+                mean_dice_loss.update(avg_dice_loss)
+                mean_mask_loss.update(avg_mask_loss)
 
                 if show_rgb:
                     rgb = torch.flip(batched_output[0]["rgb"][0].permute(1, 2, 0), dims=[-1]).detach().cpu().numpy()
-                    mask = batched_output[0]["masks"][0, 0, :, :].detach().int().cpu().numpy()
+                    mask = batched_output[0]["masks"][0, best_mask_indices[0], :, :].detach().int().cpu().numpy()
                     gt_show = gt[0].detach().cpu().numpy()
 
                 del batched_input, batched_output
                 loss.backward()
-                point_coords, point_labels = update_points(point_coords, point_labels, bmasks, gt)
+                point_coords, point_labels = update_points(point_coords, point_labels, best_bmasks, gt)
 
             optimizer.step()
             lr_scheduler.step()
