@@ -57,8 +57,9 @@ def transform_output_seg(batched_output):
     return torch.stack([out["logits"][0, 0, :, :] for out in batched_output], dim=0), torch.stack([out["masks"][0, 0, :, :] for out in batched_output], dim=0)
 
 
-def seg_call(net, batched_input, wavelengths, multimask_output=False):
-    return net(batched_input, wavelengths=wavelengths, multimask_output=multimask_output)
+def seg_call(net, batched_input, wavelengths, multimask_output=False, start_band=None, num_bands=None):
+    return net(batched_input, wavelengths=wavelengths, multimask_output=multimask_output,
+               start_band=start_band, num_bands=num_bands)
 
 
 def rsshow(I, scale=0.005):
@@ -82,7 +83,7 @@ def command(path):
     root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     test_py = os.path.join(root, "scripts", "test.py")
     log_path = os.path.join(root, "logs", "results.out")
-    com = f"CUDA_VISIBLE_DEVICES=6 python {test_py} --channel_proj_spectral --remove --checkpoint {path} >> {log_path}"
+    com = f"CUDA_VISIBLE_DEVICES=0 python {test_py} --remove --checkpoint {path} >> {log_path}"
     return com
 
 

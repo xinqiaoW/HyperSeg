@@ -381,6 +381,8 @@ class SpaceNetDataset(Dataset):
 
             # Add one sample per mask
             for mask_idx in range(num_masks):
+                if masks[mask_idx].sum() <= 50:
+                    continue
                 self.samples.append({
                     'gt_path': gt_path,
                     'hsi_x_path': hsi_x_path,

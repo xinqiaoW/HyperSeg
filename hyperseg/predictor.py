@@ -74,6 +74,36 @@ class SamPredictor:
             of masks and H=W=256. These low resolution logits can be passed to
             a subsequent iteration as mask input.
         """
+        if not self.is_image_set:
+            raise RuntimeError(
+                "An image must be set with .set_image(...) before mask prediction."
+            )
+
+        # Transform input prompts
+        coords_torch, labels_torch, box_torch, mask_input_torch = None, None, None, None
+        if point_coords is not None:
+            assert point_labels is not None, "point_labels must be supplied if point_coords is supplied."
+            point_coords = self.transform.apply_coords(point_coords, self.original_size)
+            coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=self.device)
+            labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=self.device)
+            coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
+        if box is not None:
+            box = self.transform.apply_boxes(box, self.original_size)
+            box_torch = torch.as_tensor(box, dtype=torch.float, device=self.device)
+            box_torch = box_torch[None, :]
+        if mask_input is not None:
+            mask_input_torch = torch.as_tensor(mask_input, dtype=torch.float, device=self.device)
+            mask_input_torch = mask_input_torch[None, :, :, :]
+
+        masks, iou_predictions, low_res_masks = self.predict_torch(
+            coords_torch,
+            labels_torch,
+            box_torch,
+            mask_input_torch,
+            multimask_output,
+            return_logits=return_logits,
+        )
+
         masks_np = masks[0].detach().cpu().numpy()
         iou_predictions_np = iou_predictions[0].detach().cpu().numpy()
         low_res_masks_np = low_res_masks[0].detach().cpu().numpy()
@@ -150,7 +180,7 @@ class SamPredictor:
                 }
             )
 
-        output = self.model(batched_input, wavelengths=wl, multimask_output=multimask_output)
+        output = self.model(batched_input, wl, multimask_output)
 
         if return_logits:
             masks = torch.cat([out["logits"] for out in output], dim=0)

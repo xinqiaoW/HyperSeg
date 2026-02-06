@@ -1,284 +1,353 @@
-import sys
+import argparse
 import os
-
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import random
+import subprocess
+import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-import random
-from hyperseg import build_seg_vit_h
-import argparse
+
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
-from typing import List
-import PIL
-import cv2
-from hyperseg.modeling.dataset import CustomDataset
-from hyperseg.utils.focal_loss import loss_masks
-from hyperseg.autoMetric import SegMetric
-import os
-from hyperseg.utils.tools import create_point_coords, mask_iou, build_input_for_hyperseg, seg_call, transform_output_seg, pca_dr, command, update_points, Meaner
-from torch.cuda.amp import autocast, GradScaler
 import torch.optim as optim
-import subprocess
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from hyperseg import build_seg_vit_h
+from hyperseg.modeling.dataset import CustomDataset, SpaceNetDataset
+from hyperseg.utils.focal_loss import loss_masks
+from hyperseg.utils.tools import (
+    Meaner,
+    build_input_for_hyperseg,
+    command,
+    create_point_coords,
+    seg_call,
+    transform_output_seg,
+    update_points,
+)
 
 
-def log_module_param_memory(model, log_dir='./logs', filename='module_param_memory.txt'):
+def log_module_param_memory(
+    model: nn.Module,
+    log_dir: str = './logs',
+    filename: str = 'module_param_memory.txt'
+) -> None:
+    """Log parameter and buffer memory usage for each module."""
     os.makedirs(log_dir, exist_ok=True)
     lines = []
     total_bytes = 0
+
     for name, module in model.named_modules():
-        param_bytes = 0
-        for p in module.parameters(recurse=False):
-            param_bytes += p.numel() * p.element_size()
-        buffer_bytes = 0
-        for b in module.buffers(recurse=False):
-            buffer_bytes += b.numel() * b.element_size()
+        param_bytes = sum(p.numel() * p.element_size() for p in module.parameters(recurse=False))
+        buffer_bytes = sum(b.numel() * b.element_size() for b in module.buffers(recurse=False))
         module_bytes = param_bytes + buffer_bytes
+
         if module_bytes == 0:
             continue
+
         total_bytes += module_bytes
-        module_name = name if name != '' else '<root>'
-        lines.append(f"{module_name}: {module_bytes / (1024 ** 2):.4f} MB (params {param_bytes / (1024 ** 2):.4f} MB, buffers {buffer_bytes / (1024 ** 2):.4f} MB)")
+        module_name = name if name else '<root>'
+        lines.append(
+            f"{module_name}: {module_bytes / (1024 ** 2):.4f} MB "
+            f"(params {param_bytes / (1024 ** 2):.4f} MB, buffers {buffer_bytes / (1024 ** 2):.4f} MB)"
+        )
+
     lines.append(f"TOTAL: {total_bytes / (1024 ** 2):.4f} MB")
+
     with open(os.path.join(log_dir, filename), 'w') as f:
         f.write('\n'.join(lines))
 
 
-def register_activation_memory_hooks(model):
-    module_to_name = {}
-    for name, module in model.named_modules():
-        module_to_name[module] = name if name != '' else '<root>'
-
+def register_activation_memory_hooks(model: nn.Module) -> tuple[dict, list]:
+    """Register forward hooks to track activation memory usage."""
+    module_to_name = {module: (name if name else '<root>') for name, module in model.named_modules()}
     activation_mem = {}
 
-    def accumulate_tensor_mem(obj):
-        mem = 0
+    def accumulate_tensor_mem(obj) -> int:
         if isinstance(obj, torch.Tensor):
-            mem += obj.numel() * obj.element_size()
-        elif isinstance(obj, (list, tuple)):
-            for x in obj:
-                mem += accumulate_tensor_mem(x)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                mem += accumulate_tensor_mem(v)
-        return mem
+            return obj.numel() * obj.element_size()
+        if isinstance(obj, (list, tuple)):
+            return sum(accumulate_tensor_mem(x) for x in obj)
+        if isinstance(obj, dict):
+            return sum(accumulate_tensor_mem(v) for v in obj.values())
+        return 0
 
     def hook(module, inputs, outputs):
         name = module_to_name.get(module, '<unnamed>')
         mem = accumulate_tensor_mem(outputs)
-        prev = activation_mem.get(name, 0)
-        if mem > prev:
+        if mem > activation_mem.get(name, 0):
             activation_mem[name] = mem
 
     hooks = []
     for module in model.modules():
-        if len(list(module.children())) == 0:
+        if not list(module.children()):
             hooks.append(module.register_forward_hook(hook))
+
     return activation_mem, hooks
 
 
-def train(net, lr, epochs, dataloader, optimizer, wavelengths, point_num, build_input, transform_output, net_call, save_checkpoint_path, save_name=None, device='cuda', feature_mapping=False, show_rgb=False, start_validation=False):
-    net.train()
-    total_batches = len(dataloader) * epochs # total batches
-    lr_scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=total_batches,
-            eta_min=1e-6
-        )
+def _log_first_batch_memory(
+    activation_mem: dict,
+    activation_hooks: list,
+    device: str,
+    log_dir: str = './logs'
+) -> None:
+    """Log CUDA and activation memory after first batch."""
+    try:
+        if torch.cuda.is_available():
+            mem_summary = torch.cuda.memory_summary(device=device, abbreviated=False)
+            with open(os.path.join(log_dir, 'cuda_mem_summary_first_batch.txt'), 'w') as f:
+                f.write(mem_summary)
 
-    # mean loss notes
-    mean_l = Meaner()
-    mean_dice_l = Meaner()
-    mean_masks_l = Meaner()
+        if activation_mem:
+            lines = []
+            total_bytes = 0
+            for name, bytes_ in activation_mem.items():
+                total_bytes += bytes_
+                lines.append(f"{name}: {bytes_ / (1024 ** 2):.4f} MB")
+            lines.append(f"TOTAL: {total_bytes / (1024 ** 2):.4f} MB")
+            with open(os.path.join(log_dir, 'module_activation_memory_first_batch.txt'), 'w') as f:
+                f.write('\n'.join(lines))
+    except Exception as e:
+        print(f"Failed to write CUDA memory summary: {e}")
+    finally:
+        for h in activation_hooks:
+            h.remove()
+
+
+def _get_checkpoint_name(save_name: str | None, epoch: int, batch_idx: int | None = None) -> str:
+    """Generate checkpoint filename."""
+    base = save_name if save_name else "net"
+    if batch_idx is not None:
+        return f"{base}_{epoch}_{batch_idx}.pth"
+    return f"{base}_{epoch}.pth"
+
+
+def train(
+    net: nn.Module,
+    lr: float,
+    epochs: int,
+    dataloader,
+    optimizer,
+    wavelengths,
+    point_num: int | None,
+    build_input,
+    transform_output,
+    net_call,
+    save_checkpoint_path: str,
+    save_name: str | None = None,
+    device: str = 'cuda',
+    show_rgb: bool = False,
+    start_validation: bool = False,
+    dataset_type: str = 'custom',
+    num_iterations: int = 2,
+    out_images: str = './outputs/out_images',
+    select_bands: int | None = None,
+) -> None:
+    """
+    Train the segmentation network.
+
+    Args:
+        net: The neural network model
+        lr: Learning rate
+        epochs: Number of training epochs
+        dataloader: Data loader for training data
+        optimizer: Optimizer instance
+        wavelengths: Wavelength information for HSI
+        point_num: Number of prompt points (unused, kept for API compatibility)
+        build_input: Function to build model input
+        transform_output: Function to transform model output
+        net_call: Function to call the model
+        save_checkpoint_path: Directory to save checkpoints
+        save_name: Base name for saved checkpoints
+        device: Device to train on
+        show_rgb: Whether to save RGB visualizations
+        start_validation: Whether to run validation during training
+        dataset_type: Type of dataset ('custom' or 'spacenet')
+        num_iterations: Number of point refinement iterations per batch
+        out_images: Directory to save output images
+        select_bands: Number of continuous bands to randomly select (None = use all)
+    """
+    net.train()
+    total_batches = len(dataloader) * epochs
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=total_batches, eta_min=1e-6)
+
+    mean_loss = Meaner()
+    mean_dice_loss = Meaner()
+    mean_mask_loss = Meaner()
+
     first_batch_logged = False
     activation_mem, activation_hooks = register_activation_memory_hooks(net)
 
     for epoch in range(epochs):
-        for batch_idx, ((images, gsd), gt) in enumerate(dataloader):
-            # data preprocess
-            images = images.to(device)
-            gt = gt.to(device)
+        for batch_idx, batch_data in enumerate(dataloader):
+            # Load batch data based on dataset type
+            if dataset_type == 'spacenet':
+                images, gt = batch_data
+                images = images.to(device)
+                gt = gt.to(device)
+            else:
+                (images, _gsd), gt = batch_data
+                images = images.to(device)
+                gt = gt.to(device)
+
             B, H, W = gt.shape
+            C = images.shape[1]  # Number of HSI channels
 
-            # generate point coords as prompt
+            # Generate random band selection if enabled
+            start_band, num_bands = None, None
+            if select_bands is not None and select_bands < C:
+                max_start = C - select_bands
+                start_band = random.randint(0, max_start)
+                num_bands = select_bands
+
+            # Generate point prompts
             point_coords = create_point_coords(gt, num_points=1).to(device)
-            point_labels = torch.ones((B, point_coords.shape[1])).to(device)
+            point_labels = torch.ones((B, point_coords.shape[1]), device=device)
 
-            # reset meaner
-            mean_l.reset()
-            mean_dice_l.reset()
-            mean_masks_l.reset()
+            mean_loss.reset()
+            mean_dice_loss.reset()
+            mean_mask_loss.reset()
 
             optimizer.zero_grad()
 
-            for iteration in range(args.num_iterations):
-                # build input
-                batched_input = build_input(images, shape=(H, W), point_coords=point_coords, point_labels=point_labels, device=device)
-                # forward (new interface without GSD)
-                batched_output = net_call(net, batched_input, wavelengths=wavelengths, multimask_output=False)
-                # get logits from output
+            # Iterative point refinement
+            rgb, mask, gt_show = None, None, None
+            for _ in range(num_iterations):
+                batched_input = build_input(
+                    images, shape=(H, W),
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    device=device
+                )
+                batched_output = net_call(
+                    net, batched_input, wavelengths=wavelengths, multimask_output=False,
+                    start_band=start_band, num_bands=num_bands
+                )
                 logits, bmasks = transform_output(batched_output)
-                # compute loss
-                loss_mask, loss_dice = loss_masks(logits.unsqueeze(1), gt.float().unsqueeze(1), num_masks=B)
-                l = (loss_mask + loss_dice) / args.num_iterations
 
-                mean_l.update(l.item())
-                mean_dice_l.update(loss_dice.item())
-                mean_masks_l.update(loss_mask.item())
+                loss_mask, loss_dice = loss_masks(logits.unsqueeze(1), gt.float().unsqueeze(1), num_masks=B)
+                loss = (loss_mask + loss_dice) / num_iterations
+
+                mean_loss.update(loss.item())
+                mean_dice_loss.update(loss_dice.item())
+                mean_mask_loss.update(loss_mask.item())
 
                 if show_rgb:
                     rgb = torch.flip(batched_output[0]["rgb"][0].permute(1, 2, 0), dims=[-1]).detach().cpu().numpy()
-                    # cv2.imwrite(os.path.join(args.out_images, f"rgb_{epoch}_{batch_idx}_{i}.png"), (rgb * 255).astype(np.uint8))
                     mask = batched_output[0]["masks"][0, 0, :, :].detach().int().cpu().numpy()
                     gt_show = gt[0].detach().cpu().numpy()
-                    # cv2.imwrite(os.path.join(args.out_images, f"mask_{epoch}_{batch_idx}_{i}.png"), (mask * 255).astype(np.uint8))
+
                 del batched_input, batched_output
-                l.backward()
+                loss.backward()
                 point_coords, point_labels = update_points(point_coords, point_labels, bmasks, gt)
 
             optimizer.step()
             lr_scheduler.step()
 
+            # Log memory usage after first batch
             if not first_batch_logged:
-                try:
-                    if torch.cuda.is_available():
-                        mem_summary = torch.cuda.memory_summary(device=device, abbreviated=False)
-                        with open(os.path.join('./logs', 'cuda_mem_summary_first_batch.txt'), 'w') as f:
-                            f.write(mem_summary)
-                    if activation_mem is not None:
-                        lines = []
-                        total_bytes = 0
-                        for name, bytes_ in activation_mem.items():
-                            total_bytes += bytes_
-                            lines.append(f"{name}: {bytes_ / (1024 ** 2):.4f} MB")
-                        lines.append(f"TOTAL: {total_bytes / (1024 ** 2):.4f} MB")
-                        with open(os.path.join('./logs', 'module_activation_memory_first_batch.txt'), 'w') as f:
-                            f.write('\n'.join(lines))
-                except Exception as e:
-                    print(f"Failed to write CUDA memory summary: {e}")
-                finally:
-                    for h in activation_hooks:
-                        h.remove()
+                _log_first_batch_memory(activation_mem, activation_hooks, device)
                 first_batch_logged = True
 
-            print(f"Loss Batch{batch_idx} focal loss or binary entropy loss:{mean_masks_l.avg} dice loss:{mean_dice_l.avg} loss:{mean_l.avg} Current lr:{optimizer.param_groups[0]['lr']}")
+            print(
+                f"Batch {batch_idx} | "
+                f"mask_loss: {mean_mask_loss.avg:.4f} | "
+                f"dice_loss: {mean_dice_loss.avg:.4f} | "
+                f"total_loss: {mean_loss.avg:.4f} | "
+                f"lr: {optimizer.param_groups[0]['lr']:.6f}"
+            )
 
-            # save model
+            # Save checkpoints at intervals
             if batch_idx % 50 == 0:
-                if batch_idx % 400 == 0:
-                    if start_validation:
-                        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"temp_{epoch}_{batch_idx}.pth"))
-                        com = command(os.path.join(save_checkpoint_path, f"temp_{epoch}_{batch_idx}.pth"))
-                        subprocess.Popen(com, shell=True)
-                if show_rgb:
-                    cv2.imwrite(os.path.join(args.out_images, f"rgb_{epoch}_{batch_idx}_{0}.png"), (rgb * 255).astype(np.uint8))
-                    cv2.imwrite(os.path.join(args.out_images, f"mask_{epoch}_{batch_idx}_{0}.png"), (mask * 255).astype(np.uint8))
-                    cv2.imwrite(os.path.join(args.out_images, f"gt_{epoch}_{batch_idx}_{0}.png"), (gt_show * 255).astype(np.uint8))
+                # Run validation every 400 batches
+                if batch_idx % 400 == 0 and start_validation:
+                    temp_path = os.path.join(save_checkpoint_path, f"temp_{epoch}_{batch_idx}.pth")
+                    torch.save(net.state_dict(), temp_path)
+                    subprocess.Popen(command(temp_path), shell=True)
+
+                # Save RGB visualizations
+                if show_rgb and rgb is not None:
+                    cv2.imwrite(os.path.join(out_images, f"rgb_{epoch}_{batch_idx}.png"), (rgb * 255).astype(np.uint8))
+                    cv2.imwrite(os.path.join(out_images, f"mask_{epoch}_{batch_idx}.png"), (mask * 255).astype(np.uint8))
+                    cv2.imwrite(os.path.join(out_images, f"gt_{epoch}_{batch_idx}.png"), (gt_show * 255).astype(np.uint8))
+
+                # Save periodic checkpoint every 5000 batches
                 if batch_idx % 5000 == 0:
-                    if save_name is not None:
-                        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"{save_name}_{epoch}_{batch_idx}.pth"))
-                    else:
-                        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"net_{epoch}_{batch_idx}.pth"))
-    # save checkpoint after each epoch
-    if save_name is not None:
-        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"{save_name}_{epoch}.pth"))
-    else:
-        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, f"net_{epoch}.pth"))
+                    ckpt_name = _get_checkpoint_name(save_name, epoch, batch_idx)
+                    torch.save(net.state_dict(), os.path.join(save_checkpoint_path, ckpt_name))
+
+        # Save checkpoint after each epoch
+        ckpt_name = _get_checkpoint_name(save_name, epoch)
+        torch.save(net.state_dict(), os.path.join(save_checkpoint_path, ckpt_name))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--wavelengths', type=str, default=[400.0 + (2100.0 / 112.0) * i for i in range(1, 113)]
-        , help='path wavelengths of the input image'
-    )
-    parser.add_argument(
-        '--num_iterations', type=int, default=2,
-        )
+    parser = argparse.ArgumentParser(description="Train HyperSeg model")
+
+    # Model arguments
     parser.add_argument(
         '--sam_checkpoint', type=str, default='./checkpoints/sam_vit_h_4b8939.pth',
         help='path to the SAM checkpoint'
-    )
-    parser.add_argument(
-        '--device', type=str, default='cuda:0',
-        help='device to use'
-    )
-    parser.add_argument(
-        '--hsi_path', type=str, default="/data2/pl/HSITask/data/HyperFree/data_compressed",
-        help='path to the hsi images'
-    )
-    parser.add_argument(
-        '--gt_path', type=str, default="/data2/pl/HSITask/data/HyperFree/labels_hf_nms",
-        help='path to the gt mask'
-    )
-    parser.add_argument(
-        '--index_file', type=str, default='../data/hyperfree_index.json',
-    )
-    parser.add_argument(
-        '--batch_size', type=int, default=1,
-        help='batch size'
-    )
-    parser.add_argument(
-        '--lr', type=float, default=1e-4,
-        help='learning rate'
-    )
-    parser.add_argument(
-        '--epochs', type=int, default=5,
-        help='number of epochs'
-    )
-    parser.add_argument(
-        '--save_checkpoint_path', type=str, default='./checkpoints',
-        help='path where checkpoint saves'
-    )
-    parser.add_argument(
-        '--out_images', type=str, default='./outputs/out_images',
-        help='path where images saves'
     )
     parser.add_argument(
         '--fixed_hsi_channels', type=int, default=224,
         help='fixed number of HSI channels for interpolation'
     )
     parser.add_argument(
-        '--point_num', type=int, default=None,
-        help='number of points to sample'
+        '--wavelengths', type=str,
+        default=[400.0 + (2100.0 / 224.0) * i for i in range(0, 224)],
+        help='wavelengths of the input image'
     )
-    parser.add_argument(
-        '--load_state_dict', action='store_true',
-        help='load state dict'
-    )
-    parser.add_argument(
-        '--frozen', action='store_true',help='whether to freeze the whole model'
-    )
-    parser.add_argument(
-        '--checkpoint_path', type=str, default='./checkpoints/net_2_10000.pth',
-        help='path to the checkpoint to load'
-    )
-    parser.add_argument(
-        '--save_name', type=str, default=None,
-    )
-    parser.add_argument(
-        '--start_epoch', type=int, default=0,
-    )
-    parser.add_argument(
-        '--parallel', action='store_true',help='whether to use DataParallel'
-    )
-    parser.add_argument(
-        '--num_workers', type=int, default=1,
-        help='number of workers for data loading'
-    )
-    parser.add_argument(
-        '--show_rgb', action='store_true',help='whether to show rgb image'
-    )
-    parser.add_argument(
-        '--start_validation', action='store_true',help='whether to start validation after each epoch'
-    )
+
+    # Training arguments
+    parser.add_argument('--device', type=str, default='cuda:0', help='device to use')
+    parser.add_argument('--batch_size', type=int, default=1, help='batch size')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+    parser.add_argument('--epochs', type=int, default=5, help='number of epochs')
+    parser.add_argument('--num_iterations', type=int, default=2, help='point refinement iterations per batch')
+    parser.add_argument('--num_workers', type=int, default=1, help='number of workers for data loading')
+    parser.add_argument('--point_num', type=int, default=None, help='number of points to sample')
+
+    # Checkpoint arguments
+    parser.add_argument('--save_checkpoint_path', type=str, default='./checkpoints', help='path to save checkpoints')
+    parser.add_argument('--checkpoint_path', type=str, default='./checkpoints/net_2_10000.pth', help='checkpoint to load')
+    parser.add_argument('--load_state_dict', action='store_true', help='load state dict from checkpoint')
+    parser.add_argument('--save_name', type=str, default=None, help='base name for saved checkpoints')
+    parser.add_argument('--start_epoch', type=int, default=0, help='starting epoch number')
+
+    # Model configuration
+    parser.add_argument('--parallel', action='store_true', help='use DataParallel')
+    parser.add_argument('--frozen', action='store_true', help='freeze the whole model')
+
+    # Output arguments
+    parser.add_argument('--out_images', type=str, default='./outputs/out_images', help='path to save output images')
+    parser.add_argument('--show_rgb', action='store_true', help='save RGB visualizations')
+    parser.add_argument('--start_validation', action='store_true', help='run validation during training')
+
+    # Custom dataset arguments
+    parser.add_argument('--hsi_path', type=str, default="/data2/pl/HSITask/data/HyperFree/data_compressed", help='path to HSI images')
+    parser.add_argument('--gt_path', type=str, default="/data2/pl/HSITask/data/HyperFree/labels_hf_nms", help='path to ground truth masks')
+    parser.add_argument('--index_file', type=str, default='../data/hyperfree_index.json', help='path to index file')
+
+    # SpaceNet dataset arguments
+    parser.add_argument('--dataset_type', type=str, default='custom', choices=['custom', 'spacenet'], help='dataset type')
+    parser.add_argument('--spacenet_gt_dir', type=str, default='./data/SpaceNet/ground_truth', help='SpaceNet ground truth directory')
+    parser.add_argument('--spacenet_hsi_dir', type=str, default='./data/SpaceNet/hsi_info', help='SpaceNet HSI info directory')
+    parser.add_argument('--spacenet_endmember_lib', type=str, default='./data/SpaceNet/hsi_info/endmember_libraries.npz', help='SpaceNet endmember library')
+    parser.add_argument('--spacenet_dataset', type=str, default='all', choices=['SN1', 'SN2', 'all'], help='SpaceNet dataset subset')
+
+    # Band selection arguments
+    parser.add_argument('--select_bands', type=int, default=None, help='number of continuous bands to randomly select (None = use all)')
+
     args = parser.parse_args()
+
+    # Create output directories
     os.makedirs(args.save_checkpoint_path, exist_ok=True)
     os.makedirs(args.out_images, exist_ok=True)
     os.makedirs('./logs', exist_ok=True)
 
-    # Build model with new simplified interface
+    # Build model
     seg = build_seg_vit_h(
         sam_checkpoint=args.sam_checkpoint,
         fixed_hsi_channels=args.fixed_hsi_channels
@@ -288,20 +357,36 @@ if __name__ == "__main__":
         seg = nn.DataParallel(seg, device_ids=[0, 1])
     seg = seg.to(args.device)
 
-    # load state dict
+    # Load checkpoint if specified
     if args.load_state_dict:
-        assert args.checkpoint_path is not None, f"When load_state_dict is True, checkpoint_path should not be None"
+        if args.checkpoint_path is None:
+            raise ValueError("checkpoint_path must be specified when load_state_dict is True")
         model_state_dict = torch.load(args.checkpoint_path)
         seg.load_state_dict(model_state_dict, strict=False)
         del model_state_dict
 
-    dataset = CustomDataset(args.hsi_path, args.gt_path, index_file=args.index_file)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+    # Create dataset
+    if args.dataset_type == 'spacenet':
+        print(f"Using SpaceNet dataset: {args.spacenet_dataset}")
+        dataset = SpaceNetDataset(
+            ground_truth_dir=args.spacenet_gt_dir,
+            hsi_info_dir=args.spacenet_hsi_dir,
+            endmember_lib_path=args.spacenet_endmember_lib,
+            dataset=args.spacenet_dataset,
+        )
+    else:
+        dataset = CustomDataset(args.hsi_path, args.gt_path, index_file=args.index_file)
 
-    save_name = args.save_name
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True
+    )
 
-    if args.frozen: # higher priority
-        for name, param in seg.named_parameters():
+    # Freeze model if specified
+    if args.frozen:
+        for param in seg.parameters():
             param.requires_grad = False
 
     torch.cuda.empty_cache()
@@ -309,4 +394,24 @@ if __name__ == "__main__":
 
     log_module_param_memory(seg, log_dir='./logs', filename='module_param_memory.txt')
 
-    train(seg, args.lr, args.epochs, dataloader, optimizer, wavelengths=args.wavelengths, point_num=args.point_num, build_input=build_input_for_hyperseg, transform_output=transform_output_seg, net_call=seg_call, save_checkpoint_path=args.save_checkpoint_path, device=args.device, save_name=save_name, show_rgb=args.show_rgb, start_validation=args.start_validation)
+    train(
+        net=seg,
+        lr=args.lr,
+        epochs=args.epochs,
+        dataloader=dataloader,
+        optimizer=optimizer,
+        wavelengths=args.wavelengths,
+        point_num=args.point_num,
+        build_input=build_input_for_hyperseg,
+        transform_output=transform_output_seg,
+        net_call=seg_call,
+        save_checkpoint_path=args.save_checkpoint_path,
+        save_name=args.save_name,
+        device=args.device,
+        show_rgb=args.show_rgb,
+        start_validation=args.start_validation,
+        dataset_type=args.dataset_type,
+        num_iterations=args.num_iterations,
+        out_images=args.out_images,
+        select_bands=args.select_bands,
+    )

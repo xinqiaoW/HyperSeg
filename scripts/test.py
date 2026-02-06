@@ -128,8 +128,8 @@ if __name__ == "__main__":
     974.848022, 977.070007, 979.291016, 981.512024, 983.732971, 985.953979,
     988.174988, 990.395996, 992.617004, 994.838013, 997.059021, 999.280029]
         GSD = 0.463 # Ground sampling distance (m/pixel)
-        data_path = "../Data/LongKou/WHU-Hi-LongKou.tif"
-        gt_path = "../Data/LongKou/WHU-Hi-LongKou_gt.tif"
+        data_path = "../data/LongKou/WHU-Hi-LongKou.tif"
+        gt_path = "../data/LongKou/WHU-Hi-LongKou_gt.tif"
         sample_path = "../Data/LongKou/Test"
         sample_list = os.listdir(sample_path)
 
@@ -177,7 +177,7 @@ if args.model == 'seg':
         pred_iou_thresh=pred_iou_thresh,
         stability_score_thresh=stability_score_thresh,
     )
-elif seg.model == 'hyperfree':
+elif args.model == 'hyperfree':
     pass
 
 

@@ -4,11 +4,12 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Any, Dict, List, Tuple, Optional
 
-from .image_encoder_rgb import ImageEncoderRGB, PatchEmbed
+from .image_encoder_rgb import ImageEncoderRGB, PatchEmbed, Block
 from .mask_decoder_hq import MaskDecoderHQ, MLP
 from .prompt_encoder import PromptEncoder
 from ..utils.spectral_process_utils import interpolate_hyperspectral_image_transform_matrix
 from ..utils.transforms import ResizeLongestSide
+import copy
 
 
 class ZeroConv2d(nn.Module):
@@ -120,11 +121,7 @@ class SpectralQueryFusion(nn.Module):
 
 
 class HSIPatchEmbed(nn.Module):
-    """
-    HSI Patch Embedding with channel interpolation and zero-initialized output.
-
-    Interpolates HSI to fixed channels, then creates patch embeddings.
-    """
+    """HSI Patch Embedding for fixed input channels."""
 
     def __init__(
         self,
@@ -139,87 +136,194 @@ class HSIPatchEmbed(nn.Module):
         self.fixed_channels = fixed_channels
         self.embed_dim = embed_dim
 
-        # Patch embedding for HSI (after channel interpolation)
-        self.patch_embed = nn.Conv2d(
+        # Patch embedding for HSI
+        self.proj = nn.Conv2d(
             fixed_channels, embed_dim,
             kernel_size=patch_size, stride=patch_size
         )
 
-        # Zero-initialized conv for ControlNet-style addition
-        self.zero_conv = ZeroConv2d(embed_dim, embed_dim, kernel_size=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: HSI image (B, C, H, W) with fixed_channels
+        Returns:
+            HSI tokens (B, H/patch_size, W/patch_size, embed_dim)
+        """
+        x = self.proj(x)
+        # B C H W -> B H W C (same as RGB PatchEmbed)
+        x = x.permute(0, 2, 3, 1)
+        return x
 
-        # Semantic transformation MLP (applied before addition)
-        self.semantic_transform = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=1),
+
+class ImageEncoderHSI(nn.Module):
+    """HSI Encoder that mirrors RGB encoder structure for ControlNet-style fusion.
+
+    This encoder processes HSI images and produces features at each layer
+    that can be fused with the RGB encoder via ZeroMLPs.
+    """
+
+    def __init__(
+        self,
+        img_size: int = 1024,
+        patch_size: int = 16,
+        fixed_channels: int = 224,
+        embed_dim: int = 768,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        norm_layer: type = nn.LayerNorm,
+        act_layer: type = nn.GELU,
+        use_abs_pos: bool = True,
+        use_rel_pos: bool = False,
+        rel_pos_zero_init: bool = True,
+        window_size: int = 0,
+        global_attn_indexes: Tuple[int, ...] = (),
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.fixed_channels = fixed_channels
+        self.depth = depth
+
+        # HSI-specific patch embedding
+        self.patch_embed = HSIPatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            fixed_channels=fixed_channels,
+            embed_dim=embed_dim,
         )
 
-    def interpolate_channels(self, x: torch.Tensor) -> torch.Tensor:
+        # Positional embedding (will be copied from RGB encoder)
+        self.pos_embed: Optional[nn.Parameter] = None
+        if use_abs_pos:
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+            )
+
+        # Transformer blocks (will be copied from RGB encoder)
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            block = Block(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                use_rel_pos=use_rel_pos,
+                rel_pos_zero_init=rel_pos_zero_init,
+                window_size=window_size if i not in global_attn_indexes else 0,
+                input_size=(img_size // patch_size, img_size // patch_size),
+            )
+            self.blocks.append(block)
+
+        # Zero MLPs for each layer (initialized to output zeros)
+        self.zero_mlps = nn.ModuleList([
+            ZeroMLP(embed_dim, embed_dim * 2, embed_dim, num_layers=2)
+            for _ in range(depth)
+        ])
+
+    def _select_and_interpolate_bands(
+        self,
+        x: torch.Tensor,
+        start_band: Optional[int],
+        num_bands: Optional[int],
+    ) -> torch.Tensor:
         """
-        Interpolate HSI channels to fixed number.
+        Select continuous bands and interpolate to fixed_channels.
 
         Args:
-            x: (B, C, H, W) where C is variable
+            x: HSI image (B, C, H, W) with variable channels
+            start_band: Starting band index (None means use all bands)
+            num_bands: Number of continuous bands to select (None means use all bands)
 
         Returns:
-            (B, fixed_channels, H, W)
+            Interpolated HSI (B, fixed_channels, H, W)
         """
         B, C, H, W = x.shape
-        if C == self.fixed_channels:
-            return x
 
-        # Reshape for interpolation: (B, 1, C, H*W)
-        x_flat = x.view(B, C, H * W).unsqueeze(1)
+        # If no band selection specified, use all bands
+        if start_band is None or num_bands is None:
+            selected = x
+        else:
+            # Clamp to valid range
+            start_band = max(0, min(start_band, C - 1))
+            num_bands = min(num_bands, C - start_band)
+            selected = x[:, start_band:start_band + num_bands, :, :]
 
-        # Interpolate along channel dimension
+        # Interpolate to fixed_channels
+        _, C_sel, _, _ = selected.shape
+        if C_sel == self.fixed_channels:
+            return selected
+
+        # Reshape for interpolation: (B, 1, C_sel, H*W)
+        x_flat = selected.view(B, C_sel, H * W).unsqueeze(1)
         x_interp = F.interpolate(
-            x_flat, size=(self.fixed_channels, H * W),
-            mode='bilinear', align_corners=False
+            x_flat,
+            size=(self.fixed_channels, H * W),
+            mode='bilinear',
+            align_corners=False
         )
-
         # Reshape back: (B, fixed_channels, H, W)
         x_interp = x_interp.squeeze(1).view(B, self.fixed_channels, H, W)
 
         return x_interp
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_band: Optional[int] = None,
+        num_bands: Optional[int] = None,
+    ) -> List[torch.Tensor]:
         """
+        Process HSI and return features at each layer for fusion.
+
         Args:
             x: HSI image (B, C, H, W) with variable channels
+            start_band: Starting band index for continuous band selection (None = use all)
+            num_bands: Number of continuous bands to select (None = use all)
 
         Returns:
-            HSI tokens (B, embed_dim, H/patch_size, W/patch_size) ready for addition
+            List of tensors, one per layer: (B, H/patch, W/patch, embed_dim)
+            Each tensor has been passed through ZeroMLP (initially outputs zeros)
         """
-        # Interpolate to fixed channels
-        x = self.interpolate_channels(x)
+        # Select and interpolate bands
+        x = self._select_and_interpolate_bands(x, start_band, num_bands)
 
-        # Patch embedding: (B, embed_dim, H/patch_size, W/patch_size)
+        # Patch embedding
         x = self.patch_embed(x)
 
-        # Semantic transformation
-        x = self.semantic_transform(x)
+        # Add positional embedding
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
 
-        # Zero conv for gradual learning
-        x = self.zero_conv(x)
+        # Process through blocks and collect features
+        layer_features = []
+        for i, blk in enumerate(self.blocks):
+            x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            # Apply ZeroMLP to get fusion features (initially zeros)
+            fusion_feat = self.zero_mlps[i](x)
+            layer_features.append(fusion_feat)
 
-        return x
+        return layer_features
 
 
 class HyperSeg(nn.Module):
     """HyperSeg: Hyperspectral Image Segmentation Model with ControlNet-like Structure.
 
     This model uses a ControlNet-inspired architecture where:
-    1. HSI tokens are added to RGB tokens before the ViT encoder
-    2. Spectral queries are fused and added to prompt tokens for decoding
+    1. RGB encoder (frozen) processes RGB images
+    2. HSI encoder (trainable, cloned from RGB encoder) processes HSI images
+    3. At each layer, HSI features go through ZeroMLP and are added to RGB features
 
     Args:
-        image_encoder_rgb (ImageEncoderRGB): RGB image encoder backbone (SAM ViT).
+        image_encoder_rgb (ImageEncoderRGB): RGB image encoder backbone (SAM ViT, frozen).
+        image_encoder_hsi (ImageEncoderHSI): HSI image encoder (cloned from RGB, trainable).
         prompt_encoder (PromptEncoder): SAM-style prompt encoder.
         mask_decoder_hq (MaskDecoderHQ): High-quality mask decoder.
         pixel_mean (List[float]): Mean values for RGB normalization.
         pixel_std (List[float]): Standard deviation for RGB normalization.
-        fixed_hsi_channels (int): Fixed number of channels for HSI interpolation (default: 224).
+        fixed_hsi_channels (int): Fixed number of channels for HSI interpolation.
         image_format (str): Image format (default: "RGB").
     """
 
@@ -228,6 +332,7 @@ class HyperSeg(nn.Module):
     def __init__(
             self,
             image_encoder_rgb: ImageEncoderRGB,
+            image_encoder_hsi: ImageEncoderHSI,
             prompt_encoder: PromptEncoder,
             mask_decoder_hq: MaskDecoderHQ,
             pixel_mean: List[float] = [123.675, 116.28, 103.53],
@@ -241,8 +346,11 @@ class HyperSeg(nn.Module):
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
 
-        # ============ Core Encoder and Decoder Modules ============
-        self.rgb_encoder = image_encoder_rgb
+        # ============ Dual Encoder Architecture ============
+        self.rgb_encoder = image_encoder_rgb  # Frozen
+        self.hsi_encoder = image_encoder_hsi  # Trainable
+
+        # ============ Decoder Modules ============
         self.prompt_encoder = prompt_encoder
         self.mask_decoder = mask_decoder_hq
 
@@ -252,17 +360,7 @@ class HyperSeg(nn.Module):
         self.image_format = image_format
         self.embed_dim = self.prompt_encoder.embed_dim
         self.fixed_hsi_channels = fixed_hsi_channels
-
-        # Get ViT embed_dim from RGB encoder
         self.vit_embed_dim = image_encoder_rgb.patch_embed.proj.out_channels
-
-        # ============ HSI Patch Embedding (ControlNet-style) ============
-        self.hsi_patch_embed = HSIPatchEmbed(
-            img_size=self.img_size,
-            patch_size=self.patch_size,
-            fixed_channels=fixed_hsi_channels,
-            embed_dim=self.vit_embed_dim,
-        )
 
         # ============ Spectral Query Fusion ============
         self.spectral_query_fusion = SpectralQueryFusion(
@@ -285,9 +383,17 @@ class HyperSeg(nn.Module):
             batched_input: List[Dict[str, Any]],
             wavelengths: List[float],
             multimask_output: bool,
+            start_band: Optional[int] = None,
+            num_bands: Optional[int] = None,
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        Predicts masks end-to-end from provided images and prompts.
+        Predicts masks using ControlNet-like dual encoder architecture.
+
+        The forward pass:
+        1. Convert HSI to RGB for the frozen RGB encoder
+        2. Process HSI through HSI encoder, collecting features at each layer
+        3. Process RGB through RGB encoder, adding HSI features (via ZeroMLP) at each layer
+        4. Use fused features for mask prediction
 
         Arguments:
           batched_input (list(dict)): A list over input images, each a
@@ -305,6 +411,8 @@ class HyperSeg(nn.Module):
           wavelengths (list): List of wavelengths corresponding to the input image.
           multimask_output (bool): Whether the model should predict multiple
             disambiguating masks, or return a single mask.
+          start_band (int, optional): Starting band index for HSI encoder (None = use all).
+          num_bands (int, optional): Number of continuous bands to select (None = use all).
 
         Returns:
           (list(dict)): A list over input images, where each element is
@@ -342,42 +450,35 @@ class HyperSeg(nn.Module):
                 for x in batched_input
             ], dim=0)
 
-        # ============ Step 2: Get RGB tokens ============
+        # ============ Step 2: Get HSI features from HSI encoder ============
+        # HSI encoder returns features at each layer (already passed through ZeroMLP)
+        hsi_layer_features = self.hsi_encoder(hsi_images, start_band=start_band, num_bands=num_bands)
+
+        # ============ Step 3: Process RGB through RGB encoder with HSI fusion ============
         # RGB patch embedding: (B, H/patch, W/patch, embed_dim)
-        rgb_tokens = self.rgb_encoder.patch_embed(rgb_images)
+        x = self.rgb_encoder.patch_embed(rgb_images)
 
-        # ============ Step 3: Get HSI tokens (ControlNet-style) ============
-        # HSI patch embedding with zero conv: (B, embed_dim, H/patch, W/patch)
-        hsi_tokens = self.hsi_patch_embed(hsi_images)
-        # Convert to (B, H/patch, W/patch, embed_dim) to match RGB tokens
-        hsi_tokens = hsi_tokens.permute(0, 2, 3, 1)
-
-        # ============ Step 4: Add HSI tokens to RGB tokens ============
-        combined_tokens = rgb_tokens + hsi_tokens
-
-        # Add positional embedding if exists
+        # Add positional embedding
         if self.rgb_encoder.pos_embed is not None:
-            combined_tokens = combined_tokens + self.rgb_encoder.pos_embed
+            x = x + self.rgb_encoder.pos_embed
 
-        # ============ Step 5: Pass through ViT blocks ============
-        x = combined_tokens
-        for blk in self.rgb_encoder.blocks:
+        # Process through RGB encoder blocks with layer-wise HSI fusion
+        for i, blk in enumerate(self.rgb_encoder.blocks):
             x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            # Add HSI features (ZeroMLP output) to RGB features
+            x = x + hsi_layer_features[i]
 
         # Apply neck: (B, out_chans, H/patch, W/patch)
         image_embeddings = self.rgb_encoder.neck(x.permute(0, 3, 1, 2))
 
-        # ============ Step 6: Extract spectral queries ============
-        # Interpolate HSI to fixed channels for query extraction
-        hsi_interp = self.hsi_patch_embed.interpolate_channels(hsi_images)
-
+        # ============ Step 4: Extract spectral queries ============
         # Extract spectral queries at point locations
-        spectral_queries = self._extract_spectral_queries(hsi_interp, batched_input)
+        spectral_queries = self._extract_spectral_queries(hsi_images, batched_input)
 
         # Fuse spectral queries into single token: (B, 1, embed_dim)
         fused_spectral_token = self.spectral_query_fusion(spectral_queries)
 
-        # ============ Step 7: Process each image for mask prediction ============
+        # ============ Step 5: Process each image for mask prediction ============
         predictions = []
         for batch_idx, image_record in enumerate(batched_input):
             # Extract point prompts
@@ -401,9 +502,7 @@ class HyperSeg(nn.Module):
             )
 
             # Add fused spectral token to sparse prompt embeddings
-            # sparse_prompt_embeddings: (1, N, embed_dim)
-            # fused_spectral_token: (B, 1, embed_dim)
-            spectral_token = fused_spectral_token[batch_idx:batch_idx+1]  # (1, 1, embed_dim)
+            spectral_token = fused_spectral_token[batch_idx:batch_idx+1]
             sparse_prompt_embeddings = sparse_prompt_embeddings + spectral_token.expand_as(sparse_prompt_embeddings)
 
             # Decode masks
@@ -438,20 +537,20 @@ class HyperSeg(nn.Module):
 
     def _extract_spectral_queries(
         self,
-        hsi_interp: torch.Tensor,
+        hsi: torch.Tensor,
         batched_input: List[Dict[str, Any]],
     ) -> torch.Tensor:
         """
-        Extract spectral queries from interpolated HSI at point locations.
+        Extract spectral queries from HSI at point locations.
 
         Args:
-            hsi_interp: (B, fixed_channels, H, W) interpolated HSI
+            hsi: (B, C, H, W) HSI images
             batched_input: List of input dictionaries with point_coords
 
         Returns:
-            spectral_queries: (B, num_queries, fixed_channels)
+            spectral_queries: (B, num_queries, C)
         """
-        B, C, H, W = hsi_interp.shape
+        B, C, H, W = hsi.shape
         queries_list = []
 
         for batch_idx, image_record in enumerate(batched_input):
@@ -462,11 +561,11 @@ class HyperSeg(nn.Module):
                 y_coords = coords[:, 1].clamp(0, H - 1).long()
 
                 # Extract spectral values at point locations: (N, C)
-                spectral_values = hsi_interp[batch_idx, :, y_coords, x_coords].T
+                spectral_values = hsi[batch_idx, :, y_coords, x_coords].T
                 queries_list.append(spectral_values)
             else:
                 # If no points, use zeros
-                queries_list.append(torch.zeros(1, C, device=hsi_interp.device))
+                queries_list.append(torch.zeros(1, C, device=hsi.device))
 
         # Pad to same number of queries and stack
         max_queries = max(q.shape[0] for q in queries_list)
