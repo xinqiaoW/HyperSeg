@@ -27,7 +27,7 @@ def hyperspectral_classification(mask_generator, image, few_shots, spectral_leng
     """
 
     assert open_set_thresh >= 0 and open_set_thresh <=1
-    anns, multi_stage_features = mask_generator.generate(image, True, spectral_lengths, GSD)
+    anns, multi_stage_features = mask_generator.generate(image, spectral_lengths, GSD)
     mask = mask_generator.anns2mask(anns)
     img = mask_generator.show_anns(anns)
     cv2.imwrite('mask.png', (img * 255).astype(np.uint8))

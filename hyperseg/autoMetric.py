@@ -111,11 +111,10 @@ class SegMetric:
     def __init__(self, gt, pred_mask, num_classes):
         """
         Initialize the segmentation metrics calculator
-        
+
         Args:
             gt (torch.Tensor): Ground truth tensor of shape (H, W), where each pixel value is in range [0, num_classes], 0 - background
-            pred_mask (torch.Tensor): Prediction mask tensor of shape (H, W), where each pixel value is in range [0, num_classes-1], where index {i} is {i + 1} in gt.That's because 
-			we don't predict background.
+            pred_mask (torch.Tensor): Prediction mask tensor of shape (H, W), where each pixel value is in range [0, num_classes]
             num_classes (int): Number of classes (doesn't include background)
         """
         self.gt = gt
@@ -125,88 +124,91 @@ class SegMetric:
         self.OA = None  # Overall Accuracy
         self.AA = None  # Average Accuracy
         self.KA = None  # Kappa Coefficient
-	
 
-        
+
     def compute_confusion_matrix(self):
         """
-        Compute the confusion matrix for multi-class segmentation
-        
+        Compute the confusion matrix for multi-class segmentation.
+        Only considers pixels where GT is foreground (gt != 0).
+
         Returns:
-            torch.Tensor: Confusion matrix of shape (num_classes, num_classes)
+            torch.Tensor: Confusion matrix of shape (num_classes + 1, num_classes + 1)
+                          Row 0 will be all zeros (GT background is masked out).
+                          Column 0 captures predictions of background for foreground GT pixels (misses).
         """
-        # Initialize confusion matrix
-        confusion_matrix = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64)
-        
-        # Compute confusion matrix
-        for i in range(1, self.num_classes + 1):
-            for j in range(1, self.num_classes + 1):
-                confusion_matrix[i - 1, j - 1] = torch.sum(((self.gt == i) & (self.pred_mask == j)).int())
-        print(confusion_matrix)
+        # Move to CPU and flatten tensors
+        gt_flat = self.gt.detach().cpu().flatten().long()
+        pred_flat = self.pred_mask.detach().cpu().flatten().long()
+
+        # Only consider pixels where GT is foreground
+        valid_mask = (gt_flat != 0)
+        gt_valid = gt_flat[valid_mask]
+        pred_valid = pred_flat[valid_mask]
+
+        # Compute confusion matrix using bincount (fast)
+        n = self.num_classes + 1
+        idxs = gt_valid * n + pred_valid
+        confusion_matrix = torch.bincount(idxs, minlength=n**2).reshape(n, n).float()
+
         self.confusion_matrix = confusion_matrix
         return confusion_matrix
-    
+
     def compute_metrics(self):
         """
-        Compute Overall Accuracy (OA), Average Accuracy (AA), and Kappa Coefficient (KA)
-        
+        Compute Overall Accuracy (OA), Average Accuracy (AA), and Kappa Coefficient (KA).
+        Only uses foreground classes (rows 1 to num_classes) for metric computation.
+
         Returns:
             tuple: (OA, AA, KA)
         """
         if self.confusion_matrix is None:
             self.compute_confusion_matrix()
-            
-        # Compute Overall Accuracy (OA)
-        correct_predictions = torch.sum(torch.diag(self.confusion_matrix))
-        total_pixels = torch.sum(self.confusion_matrix)
-        self.OA = correct_predictions.float() / total_pixels.float()
-        
-        # Compute Average Accuracy (AA)
-        class_accuracies = []
-        for i in range(self.num_classes):
-            if torch.sum(self.confusion_matrix[i, :]) > 0:
-                class_acc = self.confusion_matrix[i, i].float() / torch.sum(self.confusion_matrix[i, :]).float()
-                class_accuracies.append(class_acc)
-                print(class_acc)
-        self.AA = torch.tensor(class_accuracies).mean()
-        
-        # Compute Kappa Coefficient (KA)
-        pe = 0.0
-        for i in range(self.num_classes):
-            row_sum = torch.sum(self.confusion_matrix[i, :])
-            col_sum = torch.sum(self.confusion_matrix[:, i])
-            pe += (row_sum * col_sum).float()
-        pe = pe / (total_pixels * total_pixels).float()
-        
-        self.KA = (self.OA - pe) / (1 - pe)
-        
+
+        # Extract foreground part: rows 1 to num_classes
+        # Row 0 is all zeros (GT background masked out)
+        # Column 0 captures misses (pred=0 for foreground GT)
+
+        # TP: diagonal elements for classes 1 to num_classes
+        tp = torch.diag(self.confusion_matrix)[1:]
+
+        # GT total per class: row sums for classes 1 to num_classes
+        # This includes column 0 (misses), so denominator is correct
+        gt_total = self.confusion_matrix.sum(dim=1)[1:]
+
+        # Pred total per class: column sums for classes 1 to num_classes
+        pred_total = self.confusion_matrix.sum(dim=0)[1:]
+
+        # Total foreground pixels
+        total_pixels = gt_total.sum()
+
+        # Overall Accuracy (OA): correct predictions / total foreground pixels
+        self.OA = tp.sum() / (total_pixels + 1e-6)
+
+        # Average Accuracy (AA): mean of per-class recall
+        recall = tp / (gt_total + 1e-6)
+        self.AA = recall.mean()
+
+        # Kappa Coefficient (KA)
+        # Pe calculation uses only foreground classes (1 to num_classes)
+        col_total = self.confusion_matrix.sum(dim=0)[1:]
+        pe = torch.sum(gt_total * col_total) / (total_pixels ** 2 + 1e-6)
+        self.KA = (self.OA - pe) / (1 - pe + 1e-6)
+
         return self.OA, self.AA, self.KA
-    
+
     def get_metrics(self):
         """
         Get all computed metrics
-        
+
         Returns:
             dict: Dictionary containing OA, AA, KA, and confusion matrix
         """
         if self.OA is None:
             self.compute_metrics()
-            
+
         return {
             'OA': self.OA.item(),
             'AA': self.AA.item(),
             'KA': self.KA.item(),
             'confusion_matrix': self.confusion_matrix
         }
-	
-    # def pair_pred_mask_index_with_gt(self):
-    #     """
-	# 	if pred mask's index is not same as gt's index, then change the pred mask's index to gt's index
-	# 	only helpful when pred mask is much better than random mask.
-	# 	"""
-    #     confusion_matrix = self.compute_confusion_matrix()
-    #     row_ind, col_ind = linear_sum_assignment(confusion_matrix.detach().numpy(), maximize=True)
-    #     for i in range(self.num_classes):
-    #         j = col_ind[i]
-    #         if i != j:
-    #             self.pred_mask[self.pred_mask == j] = i

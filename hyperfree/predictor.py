@@ -1,11 +1,11 @@
 import numpy as np
 import torch
 
-from HyperFree.modeling import Sam
+from hyperfree.modeling import Sam
 
 from typing import Optional, Tuple
 
-from HyperFree.utils.transforms import ResizeLongestSide
+from hyperfree.utils.transforms import ResizeLongestSide
 
 
 class HyperFree_Predictor:
